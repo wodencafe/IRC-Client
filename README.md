@@ -4,6 +4,7 @@ This project targets the M5Stack Cardputer and implements a compact IRC client w
 
 - RFC-style IRC registration flow (`PASS`, `NICK`, `USER`)
 - Direct TLS support with `WiFiClientSecure`
+- Built-in IRC network presets with persistent selection
 - Proxy support:
   - SOCKS5
   - HTTP CONNECT
@@ -34,7 +35,7 @@ This project targets the M5Stack Cardputer and implements a compact IRC client w
 
 ## Build
 
-Use PlatformIO with the `m5stack-cardputer` environment.
+Use PlatformIO with the `m5stack-stamps3` environment.
 
 ## SD card layout
 
@@ -48,6 +49,7 @@ Example:
 wifi_ssid=YOUR_WIFI
 wifi_pass=YOUR_PASSWORD
 
+irc_server_preset=libera
 irc_host=irc.libera.chat
 irc_port=6697
 irc_use_tls=true
@@ -90,6 +92,21 @@ reconnect_max_ms=60000
 
 log_root=/IRC
 ```
+
+If `wifi_ssid` is left as `YOUR_WIFI`, the device opens the on-device config page at boot instead of attempting a connection.
+
+Available `irc_server_preset` values:
+
+- `libera`
+- `oftc`
+- `efnet`
+- `ircnet`
+- `dalnet`
+- `undernet`
+- `quakenet`
+- `custom`
+
+When a preset other than `custom` is selected, the client syncs `irc_host`, `irc_port`, and `irc_use_tls` to that network's recommended defaults.
 
 ## Runtime files
 
@@ -138,6 +155,12 @@ That file is written automatically when tab state or UI preferences change.
 
 Typing plain text sends a `PRIVMSG` to the active channel or query tab.
 
+## Controls
+
+- Press `` ` `` to open the server channel list and press it again to close it.
+- In config and channel-list pages, use `;` for up and `.` for down.
+- Press `Enter` on a channel-list item to join it immediately.
+
 ## Logging
 
 Logs are stored as:
@@ -171,8 +194,8 @@ Inside the page:
 - `TAB` = next field
 - `DEL` = previous field
 - `ENTER` = edit / toggle / activate
-- `j` or `.` = next field
-- `k` or `,` = previous field
+- `.` = next field
+- `;` = previous field
 - Select `Save+Reconnect` to write `/irc/config.txt` and restart the network session
 - Select `Exit/Discard` to leave without saving
 

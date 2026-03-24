@@ -41,6 +41,7 @@ static constexpr int CONFIG_BUTTON_PIN = 0;
 static constexpr size_t MAX_TAB_LINES = 350;
 static constexpr size_t MAX_TABS = 24;
 static constexpr size_t MAX_USERS_PER_TAB = 256;
+static constexpr size_t MAX_CHANNEL_LIST_ENTRIES = 320;
 static constexpr size_t MAX_INPUT_CHARS = 700;
 static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
 static constexpr uint32_t PING_INTERVAL_MS = 60000;
@@ -50,6 +51,7 @@ static constexpr uint32_t STATE_SAVE_DEBOUNCE_MS = 1200;
 
 static constexpr const char* CONFIG_PATH = "/irc/config.txt";
 static constexpr const char* STATE_PATH = "/irc/state.txt";
+static constexpr const char* DEFAULT_WIFI_SSID = "YOUR_WIFI";
 
 enum class ProxyType {
   None,
@@ -72,6 +74,7 @@ enum class ColorMode {
 enum ConfigFieldId {
   CFG_WIFI_SSID = 0,
   CFG_WIFI_PASS,
+  CFG_IRC_SERVER,
   CFG_IRC_HOST,
   CFG_IRC_PORT,
   CFG_IRC_TLS,
@@ -103,13 +106,35 @@ enum ConfigFieldId {
   CFG_COUNT
 };
 
+struct IrcServerPreset {
+  const char* id;
+  const char* label;
+  const char* host;
+  uint16_t port;
+  bool useTLS;
+};
+
+static const IrcServerPreset IRC_SERVER_PRESETS[] = {
+  {"libera", "Libera.Chat", "irc.libera.chat", 6697, true},
+  {"oftc", "OFTC", "irc.oftc.net", 6697, true},
+  {"efnet", "EFnet", "irc.efnet.org", 6697, true},
+  {"ircnet", "IRCnet", "irc.ircnet.com", 6667, false},
+  {"dalnet", "DALnet", "irc.dal.net", 6667, false},
+  {"undernet", "Undernet", "irc.undernet.org", 6667, false},
+  {"quakenet", "QuakeNet", "irc.quakenet.org", 6667, false},
+  {"custom", "Custom", "", 0, false},
+};
+
+static constexpr size_t IRC_SERVER_PRESET_COUNT = sizeof(IRC_SERVER_PRESETS) / sizeof(IRC_SERVER_PRESETS[0]);
+
 struct Config {
   String wifiSSID;
   String wifiPass;
 
-  String endpointHost;
-  uint16_t endpointPort = 6667;
-  bool useTLS = false;
+  String serverPreset = "libera";
+  String endpointHost = "irc.libera.chat";
+  uint16_t endpointPort = 6697;
+  bool useTLS = true;
   bool tlsInsecure = true;
 
   String serverPass;
@@ -166,6 +191,12 @@ struct ChatLine {
   bool highlight = false;
   bool own = false;
   bool notice = false;
+};
+
+struct ChannelListEntry {
+  String name;
+  uint16_t users = 0;
+  String topic;
 };
 
 struct UserEntry {
@@ -438,6 +469,8 @@ class SimpleTransport {
 
 class IrcClientApp {
  public:
+  IrcClientApp() : _frameBuffer(&M5Cardputer.Display) {}
+
   void begin() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
@@ -447,19 +480,26 @@ class IrcClientApp {
     M5Cardputer.Display.fillScreen(UI_BG);
     M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
     pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
+    initFrameBuffer();
 
     initSD();
     loadConfig();
     ensureStatusTab();
     loadState();
     logStatus("Cardputer IRC starting...");
-    connectWiFi();
+    if (wifiNeedsSetup(_cfg)) {
+      logStatus("Wi-Fi not configured, opening config");
+      openConfigPage(CFG_WIFI_SSID);
+    } else {
+      connectWiFi();
+    }
   }
 
   void loop() {
     M5Cardputer.update();
     serviceButtons();
     if (_configOpen) handleConfigKeyboard();
+    else if (_channelListOpen) handleChannelListKeyboard();
     else handleKeyboard();
     serviceWiFi();
     serviceIRC();
@@ -472,6 +512,8 @@ class IrcClientApp {
 
  private:
   Config _cfg;
+  M5Canvas _frameBuffer;
+  bool _useFrameBuffer = false;
   SimpleTransport _transport;
   std::vector<Tab> _tabs;
   int _activeTab = 0;
@@ -516,6 +558,13 @@ class IrcClientApp {
   bool _configButtonPrev = false;
   uint32_t _lastConfigButtonMs = 0;
 
+  bool _channelListOpen = false;
+  bool _channelListLoading = false;
+  bool _channelListTruncated = false;
+  std::vector<ChannelListEntry> _channelList;
+  int _channelListSelected = 0;
+  int _channelListScroll = 0;
+
   String _chanTypes = "#&";
   String _prefixSymbols = "~&@%+";
   String _prefixModes = "qaohv";
@@ -537,6 +586,18 @@ class IrcClientApp {
   static bool strToBool(const String& s) {
     String v = lowerCopy(trimCopy(s));
     return v == "1" || v == "true" || v == "yes" || v == "on";
+  }
+
+  static String normalizeServerPresetId(String s) {
+    s = lowerCopy(trimCopy(s));
+    if (s == "libera.chat" || s == "libera_chat" || s == "liberachat") return "libera";
+    if (s == "oftc.net") return "oftc";
+    if (s == "efnet.org") return "efnet";
+    if (s == "ircnet.com" || s == "ircnet.net") return "ircnet";
+    if (s == "dal.net") return "dalnet";
+    if (s == "undernet.org") return "undernet";
+    if (s == "quake.net") return "quakenet";
+    return s;
   }
 
   static ProxyType parseProxyType(String s) {
@@ -743,6 +804,62 @@ class IrcClientApp {
     return !s.isEmpty() && _chanTypes.indexOf(s[0]) >= 0;
   }
 
+  static const IrcServerPreset* findServerPresetById(const String& presetId) {
+    String normalized = normalizeServerPresetId(presetId);
+    for (size_t i = 0; i < IRC_SERVER_PRESET_COUNT; ++i) {
+      if (normalized == IRC_SERVER_PRESETS[i].id) return &IRC_SERVER_PRESETS[i];
+    }
+    return nullptr;
+  }
+
+  static const IrcServerPreset* findServerPresetByEndpoint(const String& host, uint16_t port, bool useTLS) {
+    for (size_t i = 0; i + 1 < IRC_SERVER_PRESET_COUNT; ++i) {
+      const IrcServerPreset& preset = IRC_SERVER_PRESETS[i];
+      if (equalsIgnoreCase(host, preset.host) && port == preset.port && useTLS == preset.useTLS) {
+        return &preset;
+      }
+    }
+    return nullptr;
+  }
+
+  static String serverPresetLabel(const String& presetId) {
+    const IrcServerPreset* preset = findServerPresetById(presetId);
+    return preset ? String(preset->label) : String("Custom");
+  }
+
+  static size_t serverPresetIndex(const String& presetId) {
+    String normalized = normalizeServerPresetId(presetId);
+    for (size_t i = 0; i < IRC_SERVER_PRESET_COUNT; ++i) {
+      if (normalized == IRC_SERVER_PRESETS[i].id) return i;
+    }
+    return IRC_SERVER_PRESET_COUNT - 1;
+  }
+
+  static void applyServerPreset(Config& cfg, const String& presetId) {
+    const IrcServerPreset* preset = findServerPresetById(presetId);
+    if (!preset) {
+      cfg.serverPreset = "custom";
+      return;
+    }
+
+    cfg.serverPreset = preset->id;
+    if (String(preset->id) == "custom") return;
+
+    cfg.endpointHost = preset->host;
+    cfg.endpointPort = preset->port;
+    cfg.useTLS = preset->useTLS;
+  }
+
+  static void syncServerPresetFromEndpoint(Config& cfg) {
+    const IrcServerPreset* preset = findServerPresetByEndpoint(cfg.endpointHost, cfg.endpointPort, cfg.useTLS);
+    cfg.serverPreset = preset ? String(preset->id) : String("custom");
+  }
+
+  static bool wifiNeedsSetup(const Config& cfg) {
+    String ssid = trimCopy(cfg.wifiSSID);
+    return ssid.isEmpty() || equalsIgnoreCase(ssid, DEFAULT_WIFI_SSID);
+  }
+
   static String normalizeCapName(const String& token) {
     int eq = token.indexOf('=');
     return eq >= 0 ? token.substring(0, eq) : token;
@@ -751,6 +868,33 @@ class IrcClientApp {
   void initSD() {
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     _sdReady = SD.begin(SD_CS, SPI, 25000000);
+  }
+
+  void initFrameBuffer() {
+    _useFrameBuffer = false;
+    _frameBuffer.deleteSprite();
+    _frameBuffer.setColorDepth(16);
+    _frameBuffer.setTextSize(1);
+    _frameBuffer.setTextWrap(false);
+    _frameBuffer.setTextColor(UI_FG, UI_BG);
+
+    _frameBuffer.setPsram(true);
+    if (!_frameBuffer.createSprite(SCREEN_W, SCREEN_H)) {
+      _frameBuffer.setPsram(false);
+      if (!_frameBuffer.createSprite(SCREEN_W, SCREEN_H)) return;
+    }
+
+    _useFrameBuffer = true;
+  }
+
+  lgfx::LovyanGFX& drawTarget() {
+    return _useFrameBuffer
+      ? static_cast<lgfx::LovyanGFX&>(_frameBuffer)
+      : static_cast<lgfx::LovyanGFX&>(M5Cardputer.Display);
+  }
+
+  void presentFrame() {
+    if (_useFrameBuffer) _frameBuffer.pushSprite(0, 0);
   }
 
   void ensureDirRecursive(const String& path) {
@@ -771,17 +915,18 @@ class IrcClientApp {
     if (pressed && !_configButtonPrev && millis() - _lastConfigButtonMs > 180) {
       _lastConfigButtonMs = millis();
       if (_configOpen) closeConfigPage();
+      else if (_channelListOpen) closeChannelListPage();
       else openConfigPage();
     }
     _configButtonPrev = pressed;
   }
 
-  void openConfigPage() {
+  void openConfigPage(int initialSelection = 0) {
     _editCfg = _cfg;
     _configOpen = true;
     _configEditing = false;
     _configEditBuffer = "";
-    _configSelected = 0;
+    _configSelected = std::max(0, std::min(initialSelection, CFG_COUNT - 1));
     _configScroll = 0;
     _dirty = true;
   }
@@ -791,6 +936,108 @@ class IrcClientApp {
     _configEditing = false;
     _configEditBuffer = "";
     _dirty = true;
+  }
+
+  void resetChannelListState() {
+    _channelListOpen = false;
+    _channelListLoading = false;
+    _channelListTruncated = false;
+    _channelList.clear();
+    _channelListSelected = 0;
+    _channelListScroll = 0;
+    _dirty = true;
+  }
+
+  void openChannelListPage(bool refresh = true) {
+    if (!_transport.connected() || !_ircRegistered) {
+      logStatus("Channel list requires an IRC connection");
+      return;
+    }
+    _channelListOpen = true;
+    _channelListSelected = 0;
+    _channelListScroll = 0;
+    _dirty = true;
+    if (refresh || _channelList.empty()) requestChannelList();
+  }
+
+  void closeChannelListPage() {
+    _channelListOpen = false;
+    _dirty = true;
+  }
+
+  void requestChannelList() {
+    if (!_transport.connected() || !_ircRegistered) return;
+    _channelListLoading = true;
+    _channelListTruncated = false;
+    _channelList.clear();
+    _channelListSelected = 0;
+    _channelListScroll = 0;
+    sendRaw("LIST");
+    _dirty = true;
+  }
+
+  void moveChannelListSelection(int delta) {
+    if (_channelList.empty()) return;
+    _channelListSelected += delta;
+    if (_channelListSelected < 0) _channelListSelected = static_cast<int>(_channelList.size()) - 1;
+    if (_channelListSelected >= static_cast<int>(_channelList.size())) _channelListSelected = 0;
+
+    int visibleRows = std::max(1, BODY_H / (CHAR_H + 2));
+    if (_channelListSelected < _channelListScroll) _channelListScroll = _channelListSelected;
+    if (_channelListSelected >= _channelListScroll + visibleRows) {
+      _channelListScroll = _channelListSelected - visibleRows + 1;
+    }
+    if (_channelListScroll < 0) _channelListScroll = 0;
+    _dirty = true;
+  }
+
+  void addChannelListEntry(const String& name, uint16_t users, const String& topic) {
+    if (name.isEmpty()) return;
+    for (ChannelListEntry& entry : _channelList) {
+      if (equalsIgnoreCase(entry.name, name)) {
+        entry.users = users;
+        entry.topic = ellipsize(topic, 80);
+        if (_channelListOpen) _dirty = true;
+        return;
+      }
+    }
+    if (_channelList.size() >= MAX_CHANNEL_LIST_ENTRIES) {
+      _channelListTruncated = true;
+      return;
+    }
+    ChannelListEntry entry;
+    entry.name = name;
+    entry.users = users;
+    entry.topic = ellipsize(topic, 80);
+    _channelList.push_back(entry);
+    if (_channelListOpen) _dirty = true;
+  }
+
+  void finalizeChannelList() {
+    _channelListLoading = false;
+    std::sort(_channelList.begin(), _channelList.end(), [&](const ChannelListEntry& a, const ChannelListEntry& b) {
+      if (a.users != b.users) return a.users > b.users;
+      return lowerCopy(a.name) < lowerCopy(b.name);
+    });
+    if (_channelListSelected >= static_cast<int>(_channelList.size())) _channelListSelected = std::max(0, static_cast<int>(_channelList.size()) - 1);
+    String msg = "Channel list ready: " + String(_channelList.size()) + " entries";
+    if (_channelListTruncated) msg += " (truncated)";
+    logStatus(msg);
+    _dirty = true;
+  }
+
+  void joinSelectedChannelFromList() {
+    if (_channelList.empty()) return;
+    const ChannelListEntry& entry = _channelList[_channelListSelected];
+    if (entry.name.isEmpty()) return;
+    sendRaw("JOIN " + entry.name);
+    Tab& tab = getOrCreateTab(entry.name, TabType::Channel);
+    _activeTab = static_cast<int>(&tab - &_tabs[0]);
+    tab.unread = false;
+    tab.mention = false;
+    tab.scroll = 0;
+    closeChannelListPage();
+    markStateDirty();
   }
 
   bool configFieldIsAction(int idx) const {
@@ -819,6 +1066,8 @@ class IrcClientApp {
       case CFG_SASL_PASS:
       case CFG_LOG_ROOT:
         return true;
+      case CFG_IRC_SERVER:
+        return false;
       default:
         return false;
     }
@@ -828,6 +1077,7 @@ class IrcClientApp {
     switch (idx) {
       case CFG_WIFI_SSID: return "wifi_ssid";
       case CFG_WIFI_PASS: return "wifi_pass";
+      case CFG_IRC_SERVER: return "irc_server";
       case CFG_IRC_HOST: return "irc_host";
       case CFG_IRC_PORT: return "irc_port";
       case CFG_IRC_TLS: return "irc_use_tls";
@@ -864,6 +1114,7 @@ class IrcClientApp {
     switch (idx) {
       case CFG_WIFI_SSID: return _editCfg.wifiSSID;
       case CFG_WIFI_PASS: return masked ? maskSecret(_editCfg.wifiPass) : _editCfg.wifiPass;
+      case CFG_IRC_SERVER: return serverPresetLabel(_editCfg.serverPreset);
       case CFG_IRC_HOST: return _editCfg.endpointHost;
       case CFG_IRC_PORT: return String(_editCfg.endpointPort);
       case CFG_IRC_TLS: return boolToOnOff(_editCfg.useTLS);
@@ -900,8 +1151,14 @@ class IrcClientApp {
     switch (idx) {
       case CFG_WIFI_SSID: _editCfg.wifiSSID = value; break;
       case CFG_WIFI_PASS: _editCfg.wifiPass = value; break;
-      case CFG_IRC_HOST: _editCfg.endpointHost = value; break;
-      case CFG_IRC_PORT: _editCfg.endpointPort = static_cast<uint16_t>(std::max<long>(0, value.toInt())); break;
+      case CFG_IRC_HOST:
+        _editCfg.endpointHost = value;
+        syncServerPresetFromEndpoint(_editCfg);
+        break;
+      case CFG_IRC_PORT:
+        _editCfg.endpointPort = static_cast<uint16_t>(std::max<long>(0, value.toInt()));
+        syncServerPresetFromEndpoint(_editCfg);
+        break;
       case CFG_IRC_PASS: _editCfg.serverPass = value; break;
       case CFG_IRC_NICK: _editCfg.nick = value; break;
       case CFG_IRC_USER: _editCfg.username = value; break;
@@ -941,6 +1198,7 @@ class IrcClientApp {
 
     f.println("wifi_ssid=" + cfg.wifiSSID);
     f.println("wifi_pass=" + cfg.wifiPass);
+    f.println("irc_server_preset=" + cfg.serverPreset);
     f.println("irc_host=" + cfg.endpointHost);
     f.println("irc_port=" + String(cfg.endpointPort));
     f.println("irc_use_tls=" + String(cfg.useTLS ? "true" : "false"));
@@ -975,8 +1233,14 @@ class IrcClientApp {
 
   void activateConfigField() {
     switch (_configSelected) {
+      case CFG_IRC_SERVER: {
+        size_t next = (serverPresetIndex(_editCfg.serverPreset) + 1) % IRC_SERVER_PRESET_COUNT;
+        applyServerPreset(_editCfg, IRC_SERVER_PRESETS[next].id);
+        break;
+      }
       case CFG_IRC_TLS:
         _editCfg.useTLS = !_editCfg.useTLS;
+        syncServerPresetFromEndpoint(_editCfg);
         break;
       case CFG_TLS_INSECURE:
         _editCfg.tlsInsecure = !_editCfg.tlsInsecure;
@@ -1070,8 +1334,8 @@ class IrcClientApp {
     if (ks.enter) activateConfigField();
 
     for (char c : ks.word) {
-      if (c == 'j' || c == '.') moveConfigSelection(1);
-      else if (c == 'k' || c == ',') moveConfigSelection(-1);
+      if (c == '.') moveConfigSelection(1);
+      else if (c == ';') moveConfigSelection(-1);
       else if (c == ' ') activateConfigField();
     }
   }
@@ -1092,6 +1356,7 @@ class IrcClientApp {
       return;
     }
 
+    bool hasServerPreset = false;
     while (f.available()) {
       String line = f.readStringUntil('\n');
       line.replace("\r", "");
@@ -1105,6 +1370,10 @@ class IrcClientApp {
 
       if (key == "wifi_ssid") _cfg.wifiSSID = value;
       else if (key == "wifi_pass") _cfg.wifiPass = value;
+      else if (key == "irc_server_preset" || key == "irc_server") {
+        _cfg.serverPreset = normalizeServerPresetId(value);
+        hasServerPreset = true;
+      }
       else if (key == "irc_host" || key == "endpoint_host") _cfg.endpointHost = value;
       else if (key == "irc_port" || key == "endpoint_port") _cfg.endpointPort = static_cast<uint16_t>(value.toInt());
       else if (key == "irc_use_tls") _cfg.useTLS = strToBool(value);
@@ -1137,6 +1406,11 @@ class IrcClientApp {
     }
 
     f.close();
+    if (hasServerPreset) {
+      applyServerPreset(_cfg, _cfg.serverPreset);
+    } else {
+      syncServerPresetFromEndpoint(_cfg);
+    }
     if (_cfg.reconnectInitialMs == 0) _cfg.reconnectInitialMs = 3000;
     if (_cfg.reconnectMaxMs < _cfg.reconnectInitialMs) _cfg.reconnectMaxMs = _cfg.reconnectInitialMs;
     _selfNick = _cfg.nick;
@@ -1213,8 +1487,8 @@ class IrcClientApp {
   }
 
   void connectWiFi() {
-    if (_cfg.wifiSSID.isEmpty()) {
-      logStatus("Wi-Fi SSID missing");
+    if (wifiNeedsSetup(_cfg)) {
+      logStatus("Wi-Fi SSID missing or placeholder");
       return;
     }
 
@@ -1240,7 +1514,7 @@ class IrcClientApp {
   }
 
   void serviceWiFi() {
-    if (_cfg.wifiSSID.isEmpty()) return;
+    if (wifiNeedsSetup(_cfg)) return;
     if (WiFi.status() == WL_CONNECTED) {
       _wifiReady = true;
       return;
@@ -1258,6 +1532,12 @@ class IrcClientApp {
   void scheduleReconnect(const String& reason) {
     if (!reason.isEmpty()) logStatus(reason);
     _transport.close();
+    _channelListLoading = false;
+    _channelList.clear();
+    _channelListSelected = 0;
+    _channelListScroll = 0;
+    _channelListTruncated = false;
+    _channelListOpen = false;
     _ircRegistered = false;
     _awaitingPong = false;
     _capNegotiationDone = false;
@@ -1591,6 +1871,10 @@ class IrcClientApp {
     }
     if (msg.command == "MODE") {
       handleMode(msg);
+      return;
+    }
+    if (msg.command == "321" || msg.command == "322" || msg.command == "323") {
+      handleChannelListNumeric(msg);
       return;
     }
 
@@ -2204,6 +2488,31 @@ class IrcClientApp {
     if (tab->type == TabType::Channel) updatePrefixFromMode(*tab, mode, rest, true);
   }
 
+  void handleChannelListNumeric(const IrcMessage& msg) {
+    if (msg.command == "321") {
+      _channelListLoading = true;
+      _channelListTruncated = false;
+      _channelList.clear();
+      _channelListSelected = 0;
+      _channelListScroll = 0;
+      _dirty = true;
+      return;
+    }
+
+    if (msg.command == "322") {
+      if (msg.params.size() < 4) return;
+      long users = msg.params[2].toInt();
+      if (users < 0) users = 0;
+      if (users > 65535) users = 65535;
+      addChannelListEntry(msg.params[1], static_cast<uint16_t>(users), msg.params[3]);
+      return;
+    }
+
+    if (msg.command == "323") {
+      finalizeChannelList();
+    }
+  }
+
   void handleKeyboard() {
     if (!M5Cardputer.Keyboard.isChange()) return;
     if (!M5Cardputer.Keyboard.isPressed()) return;
@@ -2211,6 +2520,10 @@ class IrcClientApp {
     auto ks = M5Cardputer.Keyboard.keysState();
 
     for (char c : ks.word) {
+      if (c == '`') {
+        openChannelListPage(true);
+        continue;
+      }
       if (c >= 32 || c == '\t') {
         if (_input.length() < MAX_INPUT_CHARS) _input += c;
       }
@@ -2229,6 +2542,30 @@ class IrcClientApp {
     }
 
     _dirty = true;
+  }
+
+  void handleChannelListKeyboard() {
+    if (!M5Cardputer.Keyboard.isChange()) return;
+    if (!M5Cardputer.Keyboard.isPressed()) return;
+
+    auto ks = M5Cardputer.Keyboard.keysState();
+
+    if (ks.enter) {
+      joinSelectedChannelFromList();
+      return;
+    }
+
+    if (ks.tab) moveChannelListSelection(1);
+    if (ks.del) moveChannelListSelection(-1);
+
+    for (char c : ks.word) {
+      if (c == '`') {
+        closeChannelListPage();
+        return;
+      }
+      if (c == '.') moveChannelListSelection(1);
+      else if (c == ';') moveChannelListSelection(-1);
+    }
   }
 
   void submitInput() {
@@ -2490,7 +2827,8 @@ class IrcClientApp {
     }
 
     if (cmd == "list") {
-      sendRaw(args.isEmpty() ? "LIST" : "LIST " + args);
+      if (args.isEmpty()) openChannelListPage(true);
+      else sendRaw("LIST " + args);
       return;
     }
 
@@ -2546,41 +2884,48 @@ class IrcClientApp {
   }
 
   void drawSplash(const String& a, const String& b, const String& c) {
-    M5Cardputer.Display.fillScreen(UI_BG);
-    M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
-    M5Cardputer.Display.setCursor(8, 20);
-    M5Cardputer.Display.println("Cardputer IRC");
-    M5Cardputer.Display.setCursor(8, 45);
-    M5Cardputer.Display.println(a);
-    M5Cardputer.Display.setCursor(8, 60);
-    M5Cardputer.Display.println(b);
-    M5Cardputer.Display.setCursor(8, 75);
-    M5Cardputer.Display.println(c);
+    auto& gfx = drawTarget();
+    gfx.fillScreen(UI_BG);
+    gfx.setTextColor(UI_FG, UI_BG);
+    gfx.setCursor(8, 20);
+    gfx.println("Cardputer IRC");
+    gfx.setCursor(8, 45);
+    gfx.println(a);
+    gfx.setCursor(8, 60);
+    gfx.println(b);
+    gfx.setCursor(8, 75);
+    gfx.println(c);
+    presentFrame();
   }
 
   void draw() {
     if (!_dirty) return;
     _dirty = false;
-    M5Cardputer.Display.fillScreen(UI_BG);
+    auto& gfx = drawTarget();
+    gfx.fillScreen(UI_BG);
     if (_configOpen) {
       drawConfigPage();
-      return;
+    } else if (_channelListOpen) {
+      drawChannelListPage();
+    } else {
+      drawHeader();
+      drawBody();
+      drawInput();
     }
-    drawHeader();
-    drawBody();
-    drawInput();
+    presentFrame();
   }
 
   void drawConfigPage() {
-    M5Cardputer.Display.fillRect(0, 0, SCREEN_W, HEADER_H, UI_HEADER);
-    M5Cardputer.Display.setTextColor(UI_FG, UI_HEADER);
-    M5Cardputer.Display.setCursor(2, 3);
-    M5Cardputer.Display.print(_configEditing ? "CONFIG EDIT" : "CONFIG PAGE");
+    auto& gfx = drawTarget();
+    gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_HEADER);
+    gfx.setTextColor(UI_FG, UI_HEADER);
+    gfx.setCursor(2, 3);
+    gfx.print(_configEditing ? "CONFIG EDIT" : "CONFIG PAGE");
     String rhs = "G0 close";
-    M5Cardputer.Display.setCursor(SCREEN_W - static_cast<int>(rhs.length()) * CHAR_W - 2, 3);
-    M5Cardputer.Display.print(rhs);
+    gfx.setCursor(SCREEN_W - static_cast<int>(rhs.length()) * CHAR_W - 2, 3);
+    gfx.print(rhs);
 
-    M5Cardputer.Display.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
+    gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
     int visibleRows = std::max(1, BODY_H / (CHAR_H + 2));
     if (_configSelected < _configScroll) _configScroll = _configSelected;
@@ -2594,36 +2939,36 @@ class IrcClientApp {
     for (int idx = _configScroll; idx < CFG_COUNT && idx < _configScroll + visibleRows; ++idx) {
       bool selected = idx == _configSelected;
       uint16_t bg = selected ? UI_HILITE_BG : UI_BG;
-      M5Cardputer.Display.fillRect(0, y, SCREEN_W, CHAR_H + 2, bg);
-      M5Cardputer.Display.setTextColor(selected ? UI_WARN : UI_DIM, bg);
-      M5Cardputer.Display.setCursor(2, y);
-      M5Cardputer.Display.print(selected ? (_configEditing ? "*" : ">") : " " );
+      gfx.fillRect(0, y, SCREEN_W, CHAR_H + 2, bg);
+      gfx.setTextColor(selected ? UI_WARN : UI_DIM, bg);
+      gfx.setCursor(2, y);
+      gfx.print(selected ? (_configEditing ? "*" : ">") : " " );
 
       String label = ellipsize(getConfigFieldLabel(idx), labelChars);
       String value = ellipsize(getConfigFieldValue(idx, true), valueChars);
 
-      M5Cardputer.Display.setTextColor(UI_FG, bg);
-      M5Cardputer.Display.setCursor(10, y);
-      M5Cardputer.Display.print(label);
+      gfx.setTextColor(UI_FG, bg);
+      gfx.setCursor(10, y);
+      gfx.print(label);
 
       if (!configFieldIsAction(idx)) {
-        M5Cardputer.Display.setTextColor(selected ? UI_ACCENT : UI_FG, bg);
-        M5Cardputer.Display.setCursor(10 + labelChars * CHAR_W, y);
-        M5Cardputer.Display.print(value);
+        gfx.setTextColor(selected ? UI_ACCENT : UI_FG, bg);
+        gfx.setCursor(10 + labelChars * CHAR_W, y);
+        gfx.print(value);
       }
 
       y += CHAR_H + 2;
     }
 
     int inputY = SCREEN_H - INPUT_H;
-    M5Cardputer.Display.fillRect(0, inputY, SCREEN_W, INPUT_H, UI_INPUT);
-    M5Cardputer.Display.drawFastHLine(0, inputY, SCREEN_W, UI_DIM);
-    M5Cardputer.Display.setTextColor(UI_FG, UI_INPUT);
+    gfx.fillRect(0, inputY, SCREEN_W, INPUT_H, UI_INPUT);
+    gfx.drawFastHLine(0, inputY, SCREEN_W, UI_DIM);
+    gfx.setTextColor(UI_FG, UI_INPUT);
 
     if (_configEditing) {
       String hdr = ellipsize(getConfigFieldLabel(_configSelected), 16) + ":";
-      M5Cardputer.Display.setCursor(2, inputY + 3);
-      M5Cardputer.Display.print(hdr);
+      gfx.setCursor(2, inputY + 3);
+      gfx.print(hdr);
 
       int charsPerRow = (SCREEN_W - 4) / CHAR_W;
       String src = _configEditBuffer;
@@ -2631,23 +2976,89 @@ class IrcClientApp {
       if (static_cast<int>(src.length()) > keep) src = src.substring(src.length() - keep);
       String row1 = src.length() > static_cast<size_t>(charsPerRow) ? src.substring(0, charsPerRow) : src;
       String row2 = src.length() > static_cast<size_t>(charsPerRow) ? src.substring(charsPerRow) : "";
-      M5Cardputer.Display.setCursor(2, inputY + 10);
-      M5Cardputer.Display.print(ellipsize(row1, charsPerRow));
+      gfx.setCursor(2, inputY + 10);
+      gfx.print(ellipsize(row1, charsPerRow));
       if (!row2.isEmpty()) {
-        M5Cardputer.Display.setCursor(2, inputY + 18);
-        M5Cardputer.Display.print(ellipsize(row2, charsPerRow));
+        gfx.setCursor(2, inputY + 18);
+      gfx.print(ellipsize(row2, charsPerRow));
       }
     } else {
-      M5Cardputer.Display.setCursor(2, inputY + 4);
-      M5Cardputer.Display.print("TAB next  DEL prev  ENT");
-      M5Cardputer.Display.setCursor(2, inputY + 13);
-      M5Cardputer.Display.print("j/k or ./,  G0 exit");
+      gfx.setCursor(2, inputY + 4);
+      gfx.print("; up  . down  ENT ok");
+      gfx.setCursor(2, inputY + 13);
+      gfx.print("TAB/DEL alt   G0 exit");
     }
   }
 
+  void drawChannelListPage() {
+    auto& gfx = drawTarget();
+    gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_HEADER);
+    gfx.setTextColor(UI_FG, UI_HEADER);
+    gfx.setCursor(2, 3);
+    gfx.print(_channelListLoading ? "CHANNELS LOAD" : "CHANNEL LIST");
+
+    String rhs = "` close";
+    gfx.setCursor(SCREEN_W - static_cast<int>(rhs.length()) * CHAR_W - 2, 3);
+    gfx.print(rhs);
+
+    gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
+
+    int visibleRows = std::max(1, BODY_H / (CHAR_H + 2));
+    if (_channelListSelected < _channelListScroll) _channelListScroll = _channelListSelected;
+    if (_channelListSelected >= _channelListScroll + visibleRows) {
+      _channelListScroll = _channelListSelected - visibleRows + 1;
+    }
+    if (_channelListScroll < 0) _channelListScroll = 0;
+
+    if (_channelList.empty() && _channelListLoading) {
+      gfx.setTextColor(UI_DIM, UI_BG);
+      gfx.setCursor(8, BODY_Y + 10);
+      gfx.print("Loading channel list...");
+    } else if (_channelList.empty()) {
+      gfx.setTextColor(UI_DIM, UI_BG);
+      gfx.setCursor(8, BODY_Y + 10);
+      gfx.print("No channels available");
+    } else {
+      int y = BODY_Y + 1;
+      for (int idx = _channelListScroll; idx < static_cast<int>(_channelList.size()) && idx < _channelListScroll + visibleRows; ++idx) {
+        bool selected = idx == _channelListSelected;
+        uint16_t bg = selected ? UI_HILITE_BG : UI_BG;
+        gfx.fillRect(0, y, SCREEN_W, CHAR_H + 2, bg);
+        gfx.setTextColor(selected ? UI_WARN : UI_DIM, bg);
+        gfx.setCursor(2, y);
+        gfx.print(selected ? ">" : " ");
+
+        String row = _channelList[idx].name + " [" + String(_channelList[idx].users) + "]";
+        gfx.setTextColor(selected ? UI_ACCENT : UI_FG, bg);
+        gfx.setCursor(10, y);
+        gfx.print(ellipsize(row, 37));
+        y += CHAR_H + 2;
+      }
+    }
+
+    int inputY = SCREEN_H - INPUT_H;
+    gfx.fillRect(0, inputY, SCREEN_W, INPUT_H, UI_INPUT);
+    gfx.drawFastHLine(0, inputY, SCREEN_W, UI_DIM);
+    gfx.setTextColor(UI_FG, UI_INPUT);
+
+    String info;
+    if (_channelList.empty()) {
+      info = _channelListLoading ? "Waiting for LIST reply" : "Press ` to close";
+    } else {
+      const ChannelListEntry& entry = _channelList[_channelListSelected];
+      info = entry.topic.isEmpty() ? "No topic" : entry.topic;
+      if (_channelListTruncated) info = "(truncated) " + info;
+    }
+    gfx.setCursor(2, inputY + 4);
+    gfx.print(ellipsize(info, (SCREEN_W - 4) / CHAR_W));
+    gfx.setCursor(2, inputY + 13);
+    gfx.print("; up  . down  ENT join");
+  }
+
   void drawHeader() {
-    M5Cardputer.Display.fillRect(0, 0, SCREEN_W, HEADER_H, UI_HEADER);
-    M5Cardputer.Display.setTextColor(UI_FG, UI_HEADER);
+    auto& gfx = drawTarget();
+    gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_HEADER);
+    gfx.setTextColor(UI_FG, UI_HEADER);
 
     String title = _tabs[_activeTab].name;
     if (_tabs[_activeTab].mention) title = "!" + title;
@@ -2659,13 +3070,13 @@ class IrcClientApp {
     if (!_ircRegistered && _transport.connected()) net += "*";
     if (net.length() > 13) net = net.substring(0, 13);
 
-    M5Cardputer.Display.setCursor(2, 3);
-    M5Cardputer.Display.print(title);
+    gfx.setCursor(2, 3);
+    gfx.print(title);
 
     int rx = SCREEN_W - (net.length() * CHAR_W) - 2;
     if (rx < 110) rx = 110;
-    M5Cardputer.Display.setCursor(rx, 3);
-    M5Cardputer.Display.print(net);
+    gfx.setCursor(rx, 3);
+    gfx.print(net);
   }
 
   int bodyTextWidth() const {
@@ -2676,6 +3087,7 @@ class IrcClientApp {
   }
 
   void drawBody() {
+    auto& gfx = drawTarget();
     const Tab& tab = _tabs[_activeTab];
     bool showPane = _cfg.nickPaneEnabled && tab.type == TabType::Channel;
     int paneWidth = showPane ? NICK_PANE_W : 0;
@@ -2686,7 +3098,7 @@ class IrcClientApp {
     int end = std::min(total, start + maxLines);
     if (end - start < maxLines && start > 0) start = std::max(0, end - maxLines);
 
-    M5Cardputer.Display.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
+    gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
     int y = BODY_Y + 1;
     for (int i = start; i < end && y < BODY_Y + BODY_H - CHAR_H; ++i) {
@@ -2698,18 +3110,19 @@ class IrcClientApp {
   }
 
   void drawChatLine(int x, int y, const ChatLine& line, int maxWidth) {
+    auto& gfx = drawTarget();
     uint16_t lineBg = line.highlight ? UI_HILITE_BG : UI_BG;
-    M5Cardputer.Display.fillRect(x, y, maxWidth, CHAR_H + 1, lineBg);
+    gfx.fillRect(x, y, maxWidth, CHAR_H + 1, lineBg);
     if (line.highlight) {
-      M5Cardputer.Display.fillRect(x, y, 2, CHAR_H + 1, UI_WARN);
+      gfx.fillRect(x, y, 2, CHAR_H + 1, UI_WARN);
     }
 
     int stampX = x + 2;
-    M5Cardputer.Display.setTextColor(UI_DIM, lineBg);
-    M5Cardputer.Display.setCursor(stampX, y);
+    gfx.setTextColor(UI_DIM, lineBg);
+    gfx.setCursor(stampX, y);
     String stamp = line.stampShort;
     if (stamp.length() > 5) stamp = stamp.substring(0, 5);
-    M5Cardputer.Display.print(stamp);
+    gfx.print(stamp);
 
     int textX = x + 2 + TIMESTAMP_W_CHARS * CHAR_W;
     int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
@@ -2717,14 +3130,15 @@ class IrcClientApp {
   }
 
   void drawNickPane(const Tab& tab) {
+    auto& gfx = drawTarget();
     int x = SCREEN_W - NICK_PANE_W;
-    M5Cardputer.Display.fillRect(x, BODY_Y, NICK_PANE_W, BODY_H, UI_PANE);
-    M5Cardputer.Display.drawFastVLine(x, BODY_Y, BODY_H, UI_DIM);
-    M5Cardputer.Display.setTextColor(UI_FG, UI_PANE);
-    M5Cardputer.Display.setCursor(x + 3, BODY_Y + 2);
+    gfx.fillRect(x, BODY_Y, NICK_PANE_W, BODY_H, UI_PANE);
+    gfx.drawFastVLine(x, BODY_Y, BODY_H, UI_DIM);
+    gfx.setTextColor(UI_FG, UI_PANE);
+    gfx.setCursor(x + 3, BODY_Y + 2);
     String hdr = "Users " + String(tab.users.size());
     if (hdr.length() > 11) hdr = hdr.substring(0, 11);
-    M5Cardputer.Display.print(hdr);
+    gfx.print(hdr);
 
     int y = BODY_Y + 12;
     int maxRows = (BODY_H - 14) / (CHAR_H + 1);
@@ -2735,9 +3149,9 @@ class IrcClientApp {
       int maxChars = (NICK_PANE_W - 6) / CHAR_W;
       if (row.length() > static_cast<size_t>(maxChars)) row = row.substring(0, maxChars);
       uint16_t color = equalsIgnoreCase(tab.users[i].nick, _selfNick) ? UI_ACCENT : UI_FG;
-      M5Cardputer.Display.setTextColor(color, UI_PANE);
-      M5Cardputer.Display.setCursor(x + 3, y);
-      M5Cardputer.Display.print(row);
+      gfx.setTextColor(color, UI_PANE);
+      gfx.setCursor(x + 3, y);
+      gfx.print(row);
       y += CHAR_H + 1;
     }
   }
@@ -2762,20 +3176,22 @@ class IrcClientApp {
   }
 
   void drawInput() {
+    auto& gfx = drawTarget();
     int y = SCREEN_H - INPUT_H;
-    M5Cardputer.Display.fillRect(0, y, SCREEN_W, INPUT_H, UI_INPUT);
-    M5Cardputer.Display.drawFastHLine(0, y, SCREEN_W, UI_DIM);
-    M5Cardputer.Display.setTextColor(UI_FG, UI_INPUT);
+    gfx.fillRect(0, y, SCREEN_W, INPUT_H, UI_INPUT);
+    gfx.drawFastHLine(0, y, SCREEN_W, UI_DIM);
+    gfx.setTextColor(UI_FG, UI_INPUT);
 
     int charsPerRow = (SCREEN_W - 4) / CHAR_W;
     std::vector<String> rows = buildInputRows(charsPerRow, 2);
-    M5Cardputer.Display.setCursor(2, y + 4);
-    M5Cardputer.Display.print(rows[0]);
-    M5Cardputer.Display.setCursor(2, y + 13);
-    M5Cardputer.Display.print(rows[1]);
+    gfx.setCursor(2, y + 4);
+    gfx.print(rows[0]);
+    gfx.setCursor(2, y + 13);
+    gfx.print(rows[1]);
   }
 
   void drawStyledText(int x, int y, const String& raw, int maxWidth, uint16_t baseBg) {
+    auto& gfx = drawTarget();
     TextStyle st;
     st.fg = UI_FG;
     st.bg = baseBg;
@@ -2785,16 +3201,16 @@ class IrcClientApp {
       if (cx + CHAR_W > x + maxWidth) return;
       uint16_t fg = st.reverse ? st.bg : st.fg;
       uint16_t bg = st.reverse ? st.fg : st.bg;
-      M5Cardputer.Display.fillRect(cx, y, CHAR_W, CHAR_H + 1, bg);
-      M5Cardputer.Display.setTextColor(fg, bg);
-      M5Cardputer.Display.setCursor(cx, y);
-      M5Cardputer.Display.print(out);
+      gfx.fillRect(cx, y, CHAR_W, CHAR_H + 1, bg);
+      gfx.setTextColor(fg, bg);
+      gfx.setCursor(cx, y);
+      gfx.print(out);
       if (st.underline) {
-        M5Cardputer.Display.drawFastHLine(cx, y + CHAR_H, CHAR_W, fg);
+        gfx.drawFastHLine(cx, y + CHAR_H, CHAR_W, fg);
       }
       if (st.bold && cx + 1 < x + maxWidth) {
-        M5Cardputer.Display.setCursor(cx + 1, y);
-        M5Cardputer.Display.print(out);
+        gfx.setCursor(cx + 1, y);
+        gfx.print(out);
       }
       cx += CHAR_W;
     };

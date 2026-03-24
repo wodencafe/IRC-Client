@@ -1,6 +1,7 @@
 # Open on-device config page with G0 / BtnA
 wifi_ssid=YOUR_WIFI
 wifi_pass=YOUR_PASSWORD
+irc_server_preset=libera
 irc_host=irc.libera.chat
 irc_port=6697
 irc_use_tls=true
