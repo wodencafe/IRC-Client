@@ -1,0 +1,36 @@
+name: Build Cardputer IRC Client
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Clean
+        run: pio run -t clean -e m5stack-stamps3
+
+      - name: Build firmware
+        run: pio run -e m5stack-stamps3
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cardputer-firmware
+          path: .pio/build/m5stack-stamps3/
+          retention-days: 1
