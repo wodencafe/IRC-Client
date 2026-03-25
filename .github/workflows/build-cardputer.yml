@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PIO_ENV: m5stack-stamps3
+      ESP_CHIP: esp32s3
+      FLASH_FREQ: 80m
+      FLASH_SIZE: 8MB
     defaults:
       run:
         shell: bash
@@ -47,10 +50,9 @@ jobs:
         run: |
           pio run -e "$PIO_ENV"
 
-      - name: Collect and merge firmware
+      - name: Collect firmware files
         run: |
           set -euo pipefail
-
           BUILD_DIR=".pio/build/${PIO_ENV}"
           DIST_DIR="dist"
           mkdir -p "$DIST_DIR"
@@ -58,41 +60,84 @@ jobs:
           cp "$BUILD_DIR/firmware.bin" "$DIST_DIR/firmware.bin"
           cp "$BUILD_DIR/bootloader.bin" "$DIST_DIR/bootloader.bin"
           cp "$BUILD_DIR/partitions.bin" "$DIST_DIR/partitions.bin"
+          cp "$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin" "$DIST_DIR/boot_app0.bin"
 
-          if [[ -f "$BUILD_DIR/firmware.merged.bin" ]]; then
-            cp "$BUILD_DIR/firmware.merged.bin" "$DIST_DIR/cardputer-merged.bin"
-          else
-            BOOT_APP0="$(find "$HOME/.platformio/packages" -path '*/tools/partitions/boot_app0.bin' | head -n 1)"
+      - name: Build merged firmware variants
+        run: |
+          set -euo pipefail
+          DIST_DIR="dist"
 
-            if [[ -z "$BOOT_APP0" ]]; then
-              echo "boot_app0.bin not found in PlatformIO packages"
-              exit 1
-            fi
+          # Variant 1: exact board defaults for m5stack-stamps3 (QIO / 80MHz / 8MB)
+          python -m esptool \
+            --chip "$ESP_CHIP" merge-bin \
+            -o "$DIST_DIR/cardputer-merged-qio.bin" \
+            --flash-mode qio \
+            --flash-freq "$FLASH_FREQ" \
+            --flash-size "$FLASH_SIZE" \
+            0x1000 "$DIST_DIR/bootloader.bin" \
+            0x8000 "$DIST_DIR/partitions.bin" \
+            0xe000 "$DIST_DIR/boot_app0.bin" \
+            0x10000 "$DIST_DIR/firmware.bin"
 
-            python -m esptool \
-              --chip esp32s3 merge-bin \
-              -o "$DIST_DIR/cardputer-merged.bin" \
-              --flash-mode keep \
-              --flash-freq keep \
-              --flash-size keep \
-              --pad-to-size 8MB \
-              0x1000 "$BUILD_DIR/bootloader.bin" \
-              0x8000 "$BUILD_DIR/partitions.bin" \
-              0xe000 "$BOOT_APP0" \
-              0x10000 "$BUILD_DIR/firmware.bin"
-          fi
+          # Variant 2: conservative standalone merged image for launchers / web-style installers
+          python -m esptool \
+            --chip "$ESP_CHIP" merge-bin \
+            -o "$DIST_DIR/cardputer-merged-dio.bin" \
+            --flash-mode dio \
+            --flash-freq "$FLASH_FREQ" \
+            --flash-size "$FLASH_SIZE" \
+            0x1000 "$DIST_DIR/bootloader.bin" \
+            0x8000 "$DIST_DIR/partitions.bin" \
+            0xe000 "$DIST_DIR/boot_app0.bin" \
+            0x10000 "$DIST_DIR/firmware.bin"
 
-          sha256sum "$DIST_DIR/cardputer-merged.bin" > "$DIST_DIR/SHA256SUMS.txt"
-          sha256sum "$DIST_DIR/firmware.bin" >> "$DIST_DIR/SHA256SUMS.txt"
-          sha256sum "$DIST_DIR/bootloader.bin" >> "$DIST_DIR/SHA256SUMS.txt"
-          sha256sum "$DIST_DIR/partitions.bin" >> "$DIST_DIR/SHA256SUMS.txt"
+      - name: Inspect merged images
+        run: |
+          set -euo pipefail
+          python -m esptool --chip "$ESP_CHIP" image-info dist/cardputer-merged-qio.bin | tee dist/image-info-qio.txt
+          python -m esptool --chip "$ESP_CHIP" image-info dist/cardputer-merged-dio.bin | tee dist/image-info-dio.txt
+
+      - name: Write flashing instructions
+        run: |
+          cat > dist/FLASHING.txt <<'EOF'
+          Split flash layout:
+            0x1000  bootloader.bin
+            0x8000  partitions.bin
+            0xe000  boot_app0.bin
+            0x10000 firmware.bin
+
+          Merged flash layout:
+            0x0000  cardputer-merged-qio.bin
+            0x0000  cardputer-merged-dio.bin
+
+          Which merged file to try:
+          - Try cardputer-merged-dio.bin first for launchers / web-style installers.
+          - If you want the exact board-default flash mode, try cardputer-merged-qio.bin.
+
+          Notes:
+          - Both merged files are full-flash images and must be flashed at offset 0x0.
+          - The split files are the fallback if a launcher dislikes the merged image.
+          EOF
+
+      - name: Write checksums
+        run: |
+          sha256sum dist/cardputer-merged-qio.bin > dist/SHA256SUMS.txt
+          sha256sum dist/cardputer-merged-dio.bin >> dist/SHA256SUMS.txt
+          sha256sum dist/firmware.bin >> dist/SHA256SUMS.txt
+          sha256sum dist/bootloader.bin >> dist/SHA256SUMS.txt
+          sha256sum dist/partitions.bin >> dist/SHA256SUMS.txt
+          sha256sum dist/boot_app0.bin >> dist/SHA256SUMS.txt
 
       - name: Upload merged firmware artifact
         uses: actions/upload-artifact@v4
         with:
           name: cardputer-merged-firmware
           path: |
-            dist/cardputer-merged.bin
+            dist/cardputer-merged-qio.bin
+            dist/cardputer-merged-dio.bin
+            dist/image-info-qio.txt
+            dist/image-info-dio.txt
+            dist/FLASHING.txt
             dist/SHA256SUMS.txt
           retention-days: 7
 
@@ -104,4 +149,7 @@ jobs:
             dist/firmware.bin
             dist/bootloader.bin
             dist/partitions.bin
+            dist/boot_app0.bin
+            dist/FLASHING.txt
+            dist/SHA256SUMS.txt
           retention-days: 7
