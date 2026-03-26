@@ -51,6 +51,7 @@ static constexpr uint32_t PING_INTERVAL_MS = 60000;
 static constexpr uint32_t PONG_TIMEOUT_MS = 25000;
 static constexpr uint32_t UI_REFRESH_MS = 50;
 static constexpr uint32_t STATE_SAVE_DEBOUNCE_MS = 1200;
+static constexpr uint32_t TEXT_SCROLL_STEP_MS = 220;
 
 static constexpr const char* CONFIG_PATH = "/irc/config.txt";
 static constexpr const char* STATE_PATH = "/irc/state.txt";
@@ -513,6 +514,7 @@ class IrcClientApp {
     serviceWiFi();
     serviceIRC();
     serviceStateSave();
+    serviceTextScroll();
     if (millis() - _lastUiRefresh >= UI_REFRESH_MS) {
       draw();
       _lastUiRefresh = millis();
@@ -538,6 +540,7 @@ class IrcClientApp {
   uint32_t _lastPingMs = 0;
   uint32_t _lastRxMs = 0;
   uint32_t _lastUiRefresh = 0;
+  uint32_t _lastTextScrollTick = 0;
   uint32_t _nextWifiAttemptAt = 0;
   uint32_t _nextIrcReconnectAt = 0;
   uint32_t _currentReconnectDelayMs = 3000;
@@ -926,6 +929,95 @@ class IrcClientApp {
 
   void presentFrame() {
     if (_useFrameBuffer) _frameBuffer.pushSprite(0, 0);
+  }
+
+  void serviceTextScroll() {
+    if (_configOpen || _channelListOpen || _tabs.empty()) return;
+    if (!activeTabNeedsTextScroll()) return;
+
+    uint32_t tick = millis() / TEXT_SCROLL_STEP_MS;
+    if (tick != _lastTextScrollTick) {
+      _lastTextScrollTick = tick;
+      _dirty = true;
+    }
+  }
+
+  void getVisibleBodyRange(const Tab& tab, int& start, int& end, int& maxLines) const {
+    maxLines = BODY_H / (CHAR_H + 2);
+    int total = static_cast<int>(tab.lines.size());
+    start = std::max(0, total - maxLines - tab.scroll);
+    end = std::min(total, start + maxLines);
+    if (end - start < maxLines && start > 0) start = std::max(0, end - maxLines);
+  }
+
+  int chatTextWidth() const {
+    return bodyTextWidth() - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
+  }
+
+  int measureStyledTextColumns(const String& raw) const {
+    int cols = 0;
+    for (size_t i = 0; i < raw.length(); ++i) {
+      char c = raw[i];
+      switch (c) {
+        case 0x02:
+        case 0x0F:
+        case 0x16:
+        case 0x1D:
+        case 0x1F:
+          break;
+        case 0x03: {
+          int j = static_cast<int>(i) + 1;
+          int digits = 0;
+          while (j < static_cast<int>(raw.length()) && digits < 2 && isdigit(static_cast<unsigned char>(raw[j]))) {
+            ++j;
+            ++digits;
+          }
+          if (j < static_cast<int>(raw.length()) && raw[j] == ',') {
+            ++j;
+            digits = 0;
+            while (j < static_cast<int>(raw.length()) && digits < 2 && isdigit(static_cast<unsigned char>(raw[j]))) {
+              ++j;
+              ++digits;
+            }
+          }
+          i = j - 1;
+          break;
+        }
+        default:
+          ++cols;
+          break;
+      }
+    }
+    return cols;
+  }
+
+  int currentTextScrollOffsetCols(const ChatLine& line, int textWidth) const {
+    int visibleCols = std::max(1, textWidth / CHAR_W);
+    int totalCols = measureStyledTextColumns(line.raw);
+    if (totalCols <= visibleCols) return 0;
+
+    int overflow = totalCols - visibleCols;
+    int cycle = overflow * 2;
+    if (cycle <= 0) return 0;
+
+    int phase = static_cast<int>((millis() / TEXT_SCROLL_STEP_MS) % cycle);
+    return phase <= overflow ? phase : (cycle - phase);
+  }
+
+  bool activeTabNeedsTextScroll() const {
+    if (_activeTab < 0 || _activeTab >= static_cast<int>(_tabs.size())) return false;
+
+    const Tab& tab = _tabs[_activeTab];
+    int start = 0;
+    int end = 0;
+    int maxLines = 0;
+    getVisibleBodyRange(tab, start, end, maxLines);
+
+    int visibleCols = std::max(1, chatTextWidth() / CHAR_W);
+    for (int i = start; i < end; ++i) {
+      if (measureStyledTextColumns(tab.lines[i].raw) > visibleCols) return true;
+    }
+    return false;
   }
 
   void ensureDirRecursive(const String& path) {
@@ -3144,11 +3236,10 @@ class IrcClientApp {
     bool showPane = _cfg.nickPaneEnabled && tab.type == TabType::Channel;
     int paneWidth = showPane ? NICK_PANE_W : 0;
     int textWidth = SCREEN_W - paneWidth - 2;
-    int maxLines = BODY_H / (CHAR_H + 2);
-    int total = static_cast<int>(tab.lines.size());
-    int start = std::max(0, total - maxLines - tab.scroll);
-    int end = std::min(total, start + maxLines);
-    if (end - start < maxLines && start > 0) start = std::max(0, end - maxLines);
+    int start = 0;
+    int end = 0;
+    int maxLines = 0;
+    getVisibleBodyRange(tab, start, end, maxLines);
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
@@ -3178,7 +3269,7 @@ class IrcClientApp {
 
     int textX = x + 2 + TIMESTAMP_W_CHARS * CHAR_W;
     int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
-    drawStyledText(textX, y, line.raw, textW, lineBg);
+    drawStyledText(textX, y, line.raw, textW, lineBg, currentTextScrollOffsetCols(line, textW));
   }
 
   void drawNickPane(const Tab& tab) {
@@ -3242,14 +3333,19 @@ class IrcClientApp {
     gfx.print(rows[1]);
   }
 
-  void drawStyledText(int x, int y, const String& raw, int maxWidth, uint16_t baseBg) {
+  void drawStyledText(int x, int y, const String& raw, int maxWidth, uint16_t baseBg, int skipCols = 0) {
     auto& gfx = drawTarget();
     TextStyle st;
     st.fg = UI_FG;
     st.bg = baseBg;
     int cx = x;
+    int skippedCols = 0;
 
     auto emitChar = [&](char out) {
+      if (skippedCols < skipCols) {
+        ++skippedCols;
+        return;
+      }
       if (cx + CHAR_W > x + maxWidth) return;
       uint16_t fg = st.reverse ? st.bg : st.fg;
       uint16_t bg = st.reverse ? st.fg : st.bg;
