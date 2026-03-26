@@ -37,6 +37,9 @@ static constexpr int CHAR_H = 8;
 static constexpr int NICK_PANE_W = 76;
 static constexpr int TIMESTAMP_W_CHARS = 6;
 static constexpr int CONFIG_BUTTON_PIN = 0;
+static constexpr uint32_t CONFIG_BUTTON_SHORT_DEBOUNCE_MS = 180;
+static constexpr uint32_t CONFIG_BUTTON_LONG_PRESS_MS = 700;
+static constexpr uint32_t TITLE_SCREEN_MS = 1800;
 
 static constexpr size_t MAX_TAB_LINES = 350;
 static constexpr size_t MAX_TABS = 24;
@@ -52,6 +55,11 @@ static constexpr uint32_t STATE_SAVE_DEBOUNCE_MS = 1200;
 static constexpr const char* CONFIG_PATH = "/irc/config.txt";
 static constexpr const char* STATE_PATH = "/irc/state.txt";
 static constexpr const char* DEFAULT_WIFI_SSID = "YOUR_WIFI";
+static constexpr const char* APP_NAME = "Cardputer IRC";
+static constexpr const char* APP_VERSION = "0.1";
+
+extern const uint8_t title_boot_jpg_start[] asm("_binary_media_title_boot_jpg_start");
+extern const uint8_t title_boot_jpg_end[] asm("_binary_media_title_boot_jpg_end");
 
 enum class ProxyType {
   None,
@@ -481,12 +489,13 @@ class IrcClientApp {
     M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
     pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
     initFrameBuffer();
+    showBootTitle();
 
     initSD();
     loadConfig();
     ensureStatusTab();
     loadState();
-    logStatus("Cardputer IRC starting...");
+    logStatus(String(APP_NAME) + " v" + APP_VERSION + " starting...");
     if (wifiNeedsSetup(_cfg)) {
       logStatus("Wi-Fi not configured, opening config");
       openConfigPage(CFG_WIFI_SSID);
@@ -557,6 +566,8 @@ class IrcClientApp {
   int _configScroll = 0;
   bool _configButtonPrev = false;
   uint32_t _lastConfigButtonMs = 0;
+  uint32_t _configButtonDownAt = 0;
+  bool _configButtonLongHandled = false;
 
   bool _channelListOpen = false;
   bool _channelListLoading = false;
@@ -887,6 +898,26 @@ class IrcClientApp {
     _useFrameBuffer = true;
   }
 
+  void showBootTitle() {
+    auto& gfx = drawTarget();
+    size_t titleLen = static_cast<size_t>(title_boot_jpg_end - title_boot_jpg_start);
+    gfx.fillScreen(UI_BG);
+    if (titleLen > 0) {
+      gfx.drawJpg(title_boot_jpg_start, titleLen, 0, 0);
+    } else {
+      gfx.setTextColor(UI_FG, UI_BG);
+      gfx.setCursor(8, 20);
+      gfx.println(String(APP_NAME) + " v" + APP_VERSION);
+    }
+    presentFrame();
+
+    uint32_t start = millis();
+    while (millis() - start < TITLE_SCREEN_MS) {
+      M5Cardputer.update();
+      delay(5);
+    }
+  }
+
   lgfx::LovyanGFX& drawTarget() {
     return _useFrameBuffer
       ? static_cast<lgfx::LovyanGFX&>(_frameBuffer)
@@ -912,12 +943,33 @@ class IrcClientApp {
 
   void serviceButtons() {
     bool pressed = digitalRead(CONFIG_BUTTON_PIN) == LOW;
-    if (pressed && !_configButtonPrev && millis() - _lastConfigButtonMs > 180) {
-      _lastConfigButtonMs = millis();
-      if (_configOpen) closeConfigPage();
-      else if (_channelListOpen) closeChannelListPage();
-      else openConfigPage();
+    uint32_t now = millis();
+
+    if (pressed && !_configButtonPrev && now - _lastConfigButtonMs > CONFIG_BUTTON_SHORT_DEBOUNCE_MS) {
+      _configButtonDownAt = now;
+      _configButtonLongHandled = false;
     }
+
+    if (pressed && !_configButtonLongHandled && now - _configButtonDownAt >= CONFIG_BUTTON_LONG_PRESS_MS) {
+      _configButtonLongHandled = true;
+      if (_channelListOpen) closeChannelListPage();
+      if (_configOpen) closeConfigPage();
+      else openConfigPage();
+      _lastConfigButtonMs = now;
+    }
+
+    if (!pressed && _configButtonPrev) {
+      if (!_configButtonLongHandled && now - _lastConfigButtonMs > CONFIG_BUTTON_SHORT_DEBOUNCE_MS) {
+        if (!_configOpen && !_channelListOpen) {
+          _cfg.nickPaneEnabled = !_cfg.nickPaneEnabled;
+          appendLine(statusTab(), String("*** Nick pane ") + (_cfg.nickPaneEnabled ? "on" : "off"));
+          markStateDirty();
+        }
+        _lastConfigButtonMs = now;
+      }
+      _configButtonLongHandled = false;
+    }
+
     _configButtonPrev = pressed;
   }
 
@@ -2888,7 +2940,7 @@ class IrcClientApp {
     gfx.fillScreen(UI_BG);
     gfx.setTextColor(UI_FG, UI_BG);
     gfx.setCursor(8, 20);
-    gfx.println("Cardputer IRC");
+    gfx.println(String(APP_NAME) + " v" + APP_VERSION);
     gfx.setCursor(8, 45);
     gfx.println(a);
     gfx.setCursor(8, 60);
@@ -2921,7 +2973,7 @@ class IrcClientApp {
     gfx.setTextColor(UI_FG, UI_HEADER);
     gfx.setCursor(2, 3);
     gfx.print(_configEditing ? "CONFIG EDIT" : "CONFIG PAGE");
-    String rhs = "G0 close";
+    String rhs = "hold G0";
     gfx.setCursor(SCREEN_W - static_cast<int>(rhs.length()) * CHAR_W - 2, 3);
     gfx.print(rhs);
 
@@ -2986,7 +3038,7 @@ class IrcClientApp {
       gfx.setCursor(2, inputY + 4);
       gfx.print("; up  . down  ENT ok");
       gfx.setCursor(2, inputY + 13);
-      gfx.print("TAB/DEL alt   G0 exit");
+      gfx.print("TAB/DEL alt  hold G0");
     }
   }
 
