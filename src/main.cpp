@@ -34,6 +34,7 @@ static constexpr int BODY_Y = HEADER_H + 1;
 static constexpr int BODY_H = SCREEN_H - HEADER_H - INPUT_H - 2;
 static constexpr int CHAR_W = 6;
 static constexpr int CHAR_H = 8;
+static constexpr int ROW_H = CHAR_H + 2;
 static constexpr int NICK_PANE_W = 76;
 static constexpr int TIMESTAMP_W_CHARS = 6;
 static constexpr int CONFIG_BUTTON_PIN = 0;
@@ -71,6 +72,11 @@ enum class ColorMode {
   Mono
 };
 
+enum class BouncerMode {
+  Generic,
+  Soju
+};
+
 enum ConfigFieldId {
   CFG_WIFI_SSID = 0,
   CFG_WIFI_PASS,
@@ -90,8 +96,10 @@ enum ConfigFieldId {
   CFG_PROXY_USER,
   CFG_PROXY_PASS,
   CFG_BNC_ENABLED,
+  CFG_BNC_MODE,
   CFG_BNC_USER,
   CFG_BNC_NETWORK,
+  CFG_BNC_CLIENT,
   CFG_BNC_PASS,
   CFG_SASL_ENABLED,
   CFG_SASL_USER,
@@ -150,8 +158,10 @@ struct Config {
   String proxyPass;
 
   bool bncEnabled = false;
+  BouncerMode bncMode = BouncerMode::Generic;
   String bncUser;
   String bncNetwork;
+  String bncClient;
   String bncPass;
 
   bool saslEnabled = false;
@@ -614,6 +624,12 @@ class IrcClientApp {
     return ColorMode::Full;
   }
 
+  static BouncerMode parseBouncerMode(String s) {
+    s = lowerCopy(trimCopy(s));
+    if (s == "soju") return BouncerMode::Soju;
+    return BouncerMode::Generic;
+  }
+
   static String colorModeToString(ColorMode mode) {
     switch (mode) {
       case ColorMode::Full: return "full";
@@ -630,6 +646,14 @@ class IrcClientApp {
       case ProxyType::HttpConnect: return "http_connect";
     }
     return "none";
+  }
+
+  static String bouncerModeToString(BouncerMode mode) {
+    switch (mode) {
+      case BouncerMode::Generic: return "generic";
+      case BouncerMode::Soju: return "soju";
+    }
+    return "generic";
   }
 
   static String boolToOnOff(bool v) {
@@ -1093,8 +1117,10 @@ class IrcClientApp {
       case CFG_PROXY_USER: return "proxy_user";
       case CFG_PROXY_PASS: return "proxy_pass";
       case CFG_BNC_ENABLED: return "bnc_enabled";
+      case CFG_BNC_MODE: return "bnc_mode";
       case CFG_BNC_USER: return "bnc_user";
       case CFG_BNC_NETWORK: return "bnc_network";
+      case CFG_BNC_CLIENT: return "bnc_client";
       case CFG_BNC_PASS: return "bnc_pass";
       case CFG_SASL_ENABLED: return "sasl_enabled";
       case CFG_SASL_USER: return "sasl_user";
@@ -1130,8 +1156,10 @@ class IrcClientApp {
       case CFG_PROXY_USER: return _editCfg.proxyUser;
       case CFG_PROXY_PASS: return masked ? maskSecret(_editCfg.proxyPass) : _editCfg.proxyPass;
       case CFG_BNC_ENABLED: return boolToOnOff(_editCfg.bncEnabled);
+      case CFG_BNC_MODE: return bouncerModeToString(_editCfg.bncMode);
       case CFG_BNC_USER: return _editCfg.bncUser;
       case CFG_BNC_NETWORK: return _editCfg.bncNetwork;
+      case CFG_BNC_CLIENT: return _editCfg.bncClient;
       case CFG_BNC_PASS: return masked ? maskSecret(_editCfg.bncPass) : _editCfg.bncPass;
       case CFG_SASL_ENABLED: return boolToOnOff(_editCfg.saslEnabled);
       case CFG_SASL_USER: return _editCfg.saslUser;
@@ -1170,6 +1198,7 @@ class IrcClientApp {
       case CFG_PROXY_PASS: _editCfg.proxyPass = value; break;
       case CFG_BNC_USER: _editCfg.bncUser = value; break;
       case CFG_BNC_NETWORK: _editCfg.bncNetwork = value; break;
+      case CFG_BNC_CLIENT: _editCfg.bncClient = value; break;
       case CFG_BNC_PASS: _editCfg.bncPass = value; break;
       case CFG_SASL_USER: _editCfg.saslUser = value; break;
       case CFG_SASL_PASS: _editCfg.saslPass = value; break;
@@ -1214,8 +1243,10 @@ class IrcClientApp {
     f.println("proxy_user=" + cfg.proxyUser);
     f.println("proxy_pass=" + cfg.proxyPass);
     f.println("bnc_enabled=" + String(cfg.bncEnabled ? "true" : "false"));
+    f.println("bnc_mode=" + bouncerModeToString(cfg.bncMode));
     f.println("bnc_user=" + cfg.bncUser);
     f.println("bnc_network=" + cfg.bncNetwork);
+    f.println("bnc_client=" + cfg.bncClient);
     f.println("bnc_pass=" + cfg.bncPass);
     f.println("sasl_enabled=" + String(cfg.saslEnabled ? "true" : "false"));
     f.println("sasl_user=" + cfg.saslUser);
@@ -1252,6 +1283,10 @@ class IrcClientApp {
         break;
       case CFG_BNC_ENABLED:
         _editCfg.bncEnabled = !_editCfg.bncEnabled;
+        break;
+      case CFG_BNC_MODE:
+        if (_editCfg.bncMode == BouncerMode::Generic) _editCfg.bncMode = BouncerMode::Soju;
+        else _editCfg.bncMode = BouncerMode::Generic;
         break;
       case CFG_SASL_ENABLED:
         _editCfg.saslEnabled = !_editCfg.saslEnabled;
@@ -1389,8 +1424,10 @@ class IrcClientApp {
       else if (key == "proxy_user") _cfg.proxyUser = value;
       else if (key == "proxy_pass") _cfg.proxyPass = value;
       else if (key == "bnc_enabled") _cfg.bncEnabled = strToBool(value);
+      else if (key == "bnc_mode") _cfg.bncMode = parseBouncerMode(value);
       else if (key == "bnc_user") _cfg.bncUser = value;
       else if (key == "bnc_network") _cfg.bncNetwork = value;
+      else if (key == "bnc_client") _cfg.bncClient = value;
       else if (key == "bnc_pass") _cfg.bncPass = value;
       else if (key == "sasl_enabled") _cfg.saslEnabled = strToBool(value);
       else if (key == "sasl_user") _cfg.saslUser = value;
@@ -1628,17 +1665,75 @@ class IrcClientApp {
     if (!passLine.isEmpty()) sendRawNoEcho("PASS " + passLine);
     sendRawNoEcho("CAP LS 302");
     sendRawNoEcho("NICK " + _cfg.nick);
-    sendRawNoEcho("USER " + _cfg.username + " 0 * :" + _cfg.realname);
+    sendRawNoEcho("USER " + buildRegistrationUsername() + " 0 * :" + _cfg.realname);
+  }
+
+  String buildSojuIdentity(const String& overrideUser = "") const {
+    String user = overrideUser;
+    user.trim();
+    if (user.isEmpty()) user = _cfg.bncUser;
+    if (user.isEmpty()) return user;
+
+    bool hasNetwork = user.indexOf('/') >= 0;
+    bool hasClient = user.indexOf('@') >= 0;
+
+    // soju's manual/legacy auth shape is username[/network].
+    // Only append @client when the user explicitly configured bnc_client
+    // for a multi-client soju setup.
+    if (!hasNetwork && !_cfg.bncNetwork.isEmpty()) {
+      user += "/" + _cfg.bncNetwork;
+      hasNetwork = true;
+    }
+    if (!hasClient && !_cfg.bncClient.isEmpty()) {
+      user += "@" + _cfg.bncClient;
+    }
+    return user;
+  }
+
+  String buildRegistrationUsername() const {
+    if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju) {
+      String user = buildSojuIdentity();
+      if (!user.isEmpty()) return user;
+    }
+    return _cfg.username;
   }
 
   String buildPassLine() const {
     if (!_cfg.serverPass.isEmpty()) return _cfg.serverPass;
     if (_cfg.bncEnabled && !_cfg.bncPass.isEmpty()) {
+      if (_cfg.bncMode == BouncerMode::Soju) {
+        return _cfg.saslEnabled ? "" : _cfg.bncPass;
+      }
       String left = _cfg.bncUser;
       if (!_cfg.bncNetwork.isEmpty()) left += "/" + _cfg.bncNetwork;
       if (!left.isEmpty()) return left + ":" + _cfg.bncPass;
       return _cfg.bncPass;
     }
+    return "";
+  }
+
+  String buildSaslUser() const {
+    if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju) {
+      String explicitUser = _cfg.saslUser;
+      explicitUser.trim();
+      if (!explicitUser.isEmpty()) return buildSojuIdentity(explicitUser);
+      String user = buildSojuIdentity();
+      if (!user.isEmpty()) return user;
+    }
+    if (!_cfg.saslUser.isEmpty()) return _cfg.saslUser;
+    if (_cfg.bncEnabled && !_cfg.bncUser.isEmpty()) {
+      String user = _cfg.bncUser;
+      if (_cfg.bncMode == BouncerMode::Soju && !_cfg.bncNetwork.isEmpty()) {
+        user += "/" + _cfg.bncNetwork;
+      }
+      return user;
+    }
+    return _cfg.nick;
+  }
+
+  String buildSaslPass() const {
+    if (!_cfg.saslPass.isEmpty()) return _cfg.saslPass;
+    if (_cfg.bncEnabled && !_cfg.bncPass.isEmpty()) return _cfg.bncPass;
     return "";
   }
 
@@ -1991,6 +2086,9 @@ class IrcClientApp {
       if (saslAck && _cfg.saslEnabled && !_saslCompleted && !_saslInProgress) {
         _saslInProgress = true;
         _saslWaitingForChallenge = true;
+        if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju) {
+          appendLine(statusTab(), "*** soju SASL auth user: " + buildSaslUser(), currentTimeStampShort(), currentTimeStampLong());
+        }
         sendRaw("AUTHENTICATE PLAIN");
       } else if (!_capNegotiationDone && !_saslInProgress) {
         sendRaw("CAP END");
@@ -2055,14 +2153,15 @@ class IrcClientApp {
   }
 
   void sendSaslPlainPayload() {
-    String user = _cfg.saslUser.isEmpty() ? _cfg.nick : _cfg.saslUser;
+    String user = buildSaslUser();
+    String pass = buildSaslPass();
     std::vector<uint8_t> payload;
-    payload.reserve(user.length() * 2 + _cfg.saslPass.length() + 2);
+    payload.reserve(user.length() * 2 + pass.length() + 2);
     for (size_t i = 0; i < user.length(); ++i) payload.push_back(static_cast<uint8_t>(user[i]));
     payload.push_back(0);
     for (size_t i = 0; i < user.length(); ++i) payload.push_back(static_cast<uint8_t>(user[i]));
     payload.push_back(0);
-    for (size_t i = 0; i < _cfg.saslPass.length(); ++i) payload.push_back(static_cast<uint8_t>(_cfg.saslPass[i]));
+    for (size_t i = 0; i < pass.length(); ++i) payload.push_back(static_cast<uint8_t>(pass[i]));
 
     String encoded = base64EncodeBytes(payload.data(), payload.size());
     const int chunkSize = 400;
@@ -2618,14 +2717,16 @@ class IrcClientApp {
     mode.toLowerCase();
     int n = countStr.isEmpty() ? 1 : std::max(1, static_cast<int>(countStr.toInt()));
 
-    int page = std::max(1, BODY_H / (CHAR_H + 2) - 1);
+    int textWidth = bodyTextWidth();
+    int page = std::max(1, bodyVisibleRows() - 1);
+    int totalRows = totalWrappedRows(tab, textWidth);
     if (mode == "up") tab.scroll += n;
     else if (mode == "down") tab.scroll = std::max(0, tab.scroll - n);
     else if (mode == "pageup") tab.scroll += n * page;
     else if (mode == "pagedown") tab.scroll = std::max(0, tab.scroll - (n * page));
-    else if (mode == "top") tab.scroll = static_cast<int>(tab.lines.size());
+    else if (mode == "top") tab.scroll = std::max(0, totalRows - bodyVisibleRows());
     else if (mode == "bottom") tab.scroll = 0;
-    if (tab.scroll < 0) tab.scroll = 0;
+    clampTabScroll(tab, textWidth);
   }
 
   void handleCommand(const String& cmdLine) {
@@ -3086,47 +3187,144 @@ class IrcClientApp {
     return SCREEN_W - paneWidth - 2;
   }
 
+  int bodyVisibleRows() const {
+    return std::max(1, BODY_H / ROW_H);
+  }
+
+  int wrappedTextRows(const String& raw, int maxWidth) const {
+    int charsPerRow = std::max(1, maxWidth / CHAR_W);
+    int row = 0;
+    int col = 0;
+    bool sawPrintable = false;
+
+    auto advanceRow = [&]() {
+      ++row;
+      col = 0;
+    };
+
+    for (size_t i = 0; i < raw.length(); ++i) {
+      char c = raw[i];
+      switch (c) {
+        case 0x02:
+        case 0x0F:
+        case 0x16:
+        case 0x1D:
+        case 0x1F:
+          break;
+        case 0x03: {
+          int j = i + 1;
+          int fgDigits = 0;
+          while (j < raw.length() && fgDigits < 2 && isdigit(static_cast<unsigned char>(raw[j]))) {
+            ++j;
+            ++fgDigits;
+          }
+          if (j < raw.length() && raw[j] == ',') {
+            ++j;
+            int bgDigits = 0;
+            while (j < raw.length() && bgDigits < 2 && isdigit(static_cast<unsigned char>(raw[j]))) {
+              ++j;
+              ++bgDigits;
+            }
+          }
+          i = j - 1;
+          break;
+        }
+        case '\n':
+          advanceRow();
+          sawPrintable = true;
+          break;
+        default:
+          sawPrintable = true;
+          if (col >= charsPerRow) advanceRow();
+          ++col;
+          if (col >= charsPerRow) advanceRow();
+          break;
+      }
+    }
+
+    if (!sawPrintable) return 1;
+    return std::max(1, row + (col > 0 ? 1 : 0));
+  }
+
+  int wrappedRowsForLine(const ChatLine& line, int maxWidth) const {
+    int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
+    if (textW <= 0) return 1;
+    return wrappedTextRows(line.raw, textW);
+  }
+
+  int totalWrappedRows(const Tab& tab, int maxWidth) const {
+    int total = 0;
+    for (const ChatLine& line : tab.lines) total += wrappedRowsForLine(line, maxWidth);
+    return std::max(0, total);
+  }
+
+  void clampTabScroll(Tab& tab, int maxWidth) {
+    int maxScroll = std::max(0, totalWrappedRows(tab, maxWidth) - bodyVisibleRows());
+    if (tab.scroll < 0) tab.scroll = 0;
+    if (tab.scroll > maxScroll) tab.scroll = maxScroll;
+  }
+
   void drawBody() {
     auto& gfx = drawTarget();
-    const Tab& tab = _tabs[_activeTab];
+    Tab& tab = _tabs[_activeTab];
     bool showPane = _cfg.nickPaneEnabled && tab.type == TabType::Channel;
     int paneWidth = showPane ? NICK_PANE_W : 0;
     int textWidth = SCREEN_W - paneWidth - 2;
-    int maxLines = BODY_H / (CHAR_H + 2);
-    int total = static_cast<int>(tab.lines.size());
-    int start = std::max(0, total - maxLines - tab.scroll);
-    int end = std::min(total, start + maxLines);
-    if (end - start < maxLines && start > 0) start = std::max(0, end - maxLines);
+    clampTabScroll(tab, textWidth);
+    int visibleRows = bodyVisibleRows();
+    int totalRows = totalWrappedRows(tab, textWidth);
+    int startRow = std::max(0, totalRows - visibleRows - tab.scroll);
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
     int y = BODY_Y + 1;
-    for (int i = start; i < end && y < BODY_Y + BODY_H - CHAR_H; ++i) {
-      drawChatLine(0, y, tab.lines[i], textWidth);
-      y += CHAR_H + 2;
+    int drawnRows = 0;
+    int currentRow = 0;
+    for (const ChatLine& line : tab.lines) {
+      int lineRows = wrappedRowsForLine(line, textWidth);
+      if (currentRow + lineRows <= startRow) {
+        currentRow += lineRows;
+        continue;
+      }
+      int skipRows = std::max(0, startRow - currentRow);
+      int rowsLeft = visibleRows - drawnRows;
+      if (rowsLeft <= 0) break;
+      int usedRows = drawChatLine(0, y, line, textWidth, skipRows, rowsLeft);
+      drawnRows += usedRows;
+      y += usedRows * ROW_H;
+      currentRow += lineRows;
+      if (drawnRows >= visibleRows || y >= BODY_Y + BODY_H - CHAR_H) break;
     }
 
     if (showPane) drawNickPane(tab);
   }
 
-  void drawChatLine(int x, int y, const ChatLine& line, int maxWidth) {
+  int drawChatLine(int x, int y, const ChatLine& line, int maxWidth, int skipRows, int maxRows) {
     auto& gfx = drawTarget();
     uint16_t lineBg = line.highlight ? UI_HILITE_BG : UI_BG;
-    gfx.fillRect(x, y, maxWidth, CHAR_H + 1, lineBg);
-    if (line.highlight) {
+    int totalRows = wrappedRowsForLine(line, maxWidth);
+    int rowsToDraw = std::max(0, std::min(maxRows, totalRows - skipRows));
+    for (int row = 0; row < rowsToDraw; ++row) {
+      int rowY = y + row * ROW_H;
+      gfx.fillRect(x, rowY, maxWidth, CHAR_H + 1, lineBg);
+    }
+    if (line.highlight && skipRows == 0 && rowsToDraw > 0) {
       gfx.fillRect(x, y, 2, CHAR_H + 1, UI_WARN);
     }
 
-    int stampX = x + 2;
-    gfx.setTextColor(UI_DIM, lineBg);
-    gfx.setCursor(stampX, y);
-    String stamp = line.stampShort;
-    if (stamp.length() > 5) stamp = stamp.substring(0, 5);
-    gfx.print(stamp);
+    if (skipRows == 0 && rowsToDraw > 0) {
+      int stampX = x + 2;
+      gfx.setTextColor(UI_DIM, lineBg);
+      gfx.setCursor(stampX, y);
+      String stamp = line.stampShort;
+      if (stamp.length() > 5) stamp = stamp.substring(0, 5);
+      gfx.print(stamp);
+    }
 
     int textX = x + 2 + TIMESTAMP_W_CHARS * CHAR_W;
     int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
-    drawStyledText(textX, y, line.raw, textW, lineBg);
+    drawStyledText(textX, y, line.raw, textW, lineBg, skipRows, rowsToDraw);
+    return rowsToDraw;
   }
 
   void drawNickPane(const Tab& tab) {
@@ -3190,29 +3388,42 @@ class IrcClientApp {
     gfx.print(rows[1]);
   }
 
-  void drawStyledText(int x, int y, const String& raw, int maxWidth, uint16_t baseBg) {
+  void drawStyledText(int x, int y, const String& raw, int maxWidth, uint16_t baseBg, int skipRows = 0, int maxRows = 1) {
     auto& gfx = drawTarget();
     TextStyle st;
     st.fg = UI_FG;
     st.bg = baseBg;
     int cx = x;
+    int row = 0;
+    int charsPerRow = std::max(1, maxWidth / CHAR_W);
+    int col = 0;
+
+    auto advanceRow = [&]() {
+      ++row;
+      cx = x;
+      col = 0;
+    };
 
     auto emitChar = [&](char out) {
-      if (cx + CHAR_W > x + maxWidth) return;
-      uint16_t fg = st.reverse ? st.bg : st.fg;
-      uint16_t bg = st.reverse ? st.fg : st.bg;
-      gfx.fillRect(cx, y, CHAR_W, CHAR_H + 1, bg);
-      gfx.setTextColor(fg, bg);
-      gfx.setCursor(cx, y);
-      gfx.print(out);
-      if (st.underline) {
-        gfx.drawFastHLine(cx, y + CHAR_H, CHAR_W, fg);
-      }
-      if (st.bold && cx + 1 < x + maxWidth) {
-        gfx.setCursor(cx + 1, y);
+      if (col >= charsPerRow) advanceRow();
+      if (row >= skipRows && row < skipRows + maxRows) {
+        int drawY = y + (row - skipRows) * ROW_H;
+        uint16_t fg = st.reverse ? st.bg : st.fg;
+        uint16_t bg = st.reverse ? st.fg : st.bg;
+        gfx.fillRect(cx, drawY, CHAR_W, CHAR_H + 1, bg);
+        gfx.setTextColor(fg, bg);
+        gfx.setCursor(cx, drawY);
         gfx.print(out);
+        if (st.underline) {
+          gfx.drawFastHLine(cx, drawY + CHAR_H, CHAR_W, fg);
+        }
+        if (st.bold && cx + 1 < x + maxWidth) {
+          gfx.setCursor(cx + 1, drawY);
+          gfx.print(out);
+        }
       }
       cx += CHAR_W;
+      ++col;
     };
 
     for (size_t i = 0; i < raw.length(); ++i) {
@@ -3258,10 +3469,14 @@ class IrcClientApp {
         case 0x1F:
           st.underline = !st.underline;
           break;
+        case '\n':
+          advanceRow();
+          break;
         default:
           emitChar(c);
           break;
       }
+      if (row >= skipRows + maxRows) break;
     }
   }
 };

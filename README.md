@@ -9,6 +9,7 @@ This project targets the M5Stack Cardputer and implements a compact IRC client w
   - SOCKS5
   - HTTP CONNECT
 - Generic BNC / ZNC-style `PASS` composition
+- soju-compatible manual auth mode (`bnc_mode=soju`)
 - CAP negotiation (`CAP LS 302`, `CAP REQ`, `CAP END`)
 - IRCv3 support for:
   - `message-tags`
@@ -70,10 +71,13 @@ proxy_port=0
 proxy_user=
 proxy_pass=
 
-# Generic BNC / ZNC-style PASS generation
+# Bouncer options
 bnc_enabled=false
+bnc_mode=generic
 bnc_user=
 bnc_network=
+# Optional for multi-client soju setups only
+#bnc_client=cardputer
 bnc_pass=
 
 # SASL PLAIN
@@ -107,6 +111,15 @@ Available `irc_server_preset` values:
 - `custom`
 
 When a preset other than `custom` is selected, the client syncs `irc_host`, `irc_port`, and `irc_use_tls` to that network's recommended defaults.
+
+`bnc_mode` values:
+
+- `generic` = traditional ZNC-style `PASS user/network:password`
+- `soju` = soju-compatible manual auth; by default it uses `username[/network]` for auth. With SASL enabled it uses that identity plus the password for SASL PLAIN, and without SASL it sends the soju password in `PASS` and the soju user/network in `USER`
+
+Optional soju helper field:
+
+- `bnc_client` = optional; if set, the client appends `@<client>` to the soju identity (for example `cardputer`), yielding `username/network@client`. Leave it blank unless you intentionally want a distinct client name for a multi-client soju setup
 
 ## Runtime files
 
