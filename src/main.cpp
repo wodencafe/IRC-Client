@@ -71,6 +71,11 @@ enum class ColorMode {
   Mono
 };
 
+enum class BouncerMode {
+  Generic,
+  Soju
+};
+
 enum ConfigFieldId {
   CFG_WIFI_SSID = 0,
   CFG_WIFI_PASS,
@@ -90,6 +95,7 @@ enum ConfigFieldId {
   CFG_PROXY_USER,
   CFG_PROXY_PASS,
   CFG_BNC_ENABLED,
+  CFG_BNC_MODE,
   CFG_BNC_USER,
   CFG_BNC_NETWORK,
   CFG_BNC_PASS,
@@ -150,6 +156,7 @@ struct Config {
   String proxyPass;
 
   bool bncEnabled = false;
+  BouncerMode bncMode = BouncerMode::Generic;
   String bncUser;
   String bncNetwork;
   String bncPass;
@@ -614,6 +621,12 @@ class IrcClientApp {
     return ColorMode::Full;
   }
 
+  static BouncerMode parseBouncerMode(String s) {
+    s = lowerCopy(trimCopy(s));
+    if (s == "soju") return BouncerMode::Soju;
+    return BouncerMode::Generic;
+  }
+
   static String colorModeToString(ColorMode mode) {
     switch (mode) {
       case ColorMode::Full: return "full";
@@ -630,6 +643,14 @@ class IrcClientApp {
       case ProxyType::HttpConnect: return "http_connect";
     }
     return "none";
+  }
+
+  static String bouncerModeToString(BouncerMode mode) {
+    switch (mode) {
+      case BouncerMode::Generic: return "generic";
+      case BouncerMode::Soju: return "soju";
+    }
+    return "generic";
   }
 
   static String boolToOnOff(bool v) {
@@ -1093,6 +1114,7 @@ class IrcClientApp {
       case CFG_PROXY_USER: return "proxy_user";
       case CFG_PROXY_PASS: return "proxy_pass";
       case CFG_BNC_ENABLED: return "bnc_enabled";
+      case CFG_BNC_MODE: return "bnc_mode";
       case CFG_BNC_USER: return "bnc_user";
       case CFG_BNC_NETWORK: return "bnc_network";
       case CFG_BNC_PASS: return "bnc_pass";
@@ -1130,6 +1152,7 @@ class IrcClientApp {
       case CFG_PROXY_USER: return _editCfg.proxyUser;
       case CFG_PROXY_PASS: return masked ? maskSecret(_editCfg.proxyPass) : _editCfg.proxyPass;
       case CFG_BNC_ENABLED: return boolToOnOff(_editCfg.bncEnabled);
+      case CFG_BNC_MODE: return bouncerModeToString(_editCfg.bncMode);
       case CFG_BNC_USER: return _editCfg.bncUser;
       case CFG_BNC_NETWORK: return _editCfg.bncNetwork;
       case CFG_BNC_PASS: return masked ? maskSecret(_editCfg.bncPass) : _editCfg.bncPass;
@@ -1214,6 +1237,7 @@ class IrcClientApp {
     f.println("proxy_user=" + cfg.proxyUser);
     f.println("proxy_pass=" + cfg.proxyPass);
     f.println("bnc_enabled=" + String(cfg.bncEnabled ? "true" : "false"));
+    f.println("bnc_mode=" + bouncerModeToString(cfg.bncMode));
     f.println("bnc_user=" + cfg.bncUser);
     f.println("bnc_network=" + cfg.bncNetwork);
     f.println("bnc_pass=" + cfg.bncPass);
@@ -1252,6 +1276,10 @@ class IrcClientApp {
         break;
       case CFG_BNC_ENABLED:
         _editCfg.bncEnabled = !_editCfg.bncEnabled;
+        break;
+      case CFG_BNC_MODE:
+        if (_editCfg.bncMode == BouncerMode::Generic) _editCfg.bncMode = BouncerMode::Soju;
+        else _editCfg.bncMode = BouncerMode::Generic;
         break;
       case CFG_SASL_ENABLED:
         _editCfg.saslEnabled = !_editCfg.saslEnabled;
@@ -1389,6 +1417,7 @@ class IrcClientApp {
       else if (key == "proxy_user") _cfg.proxyUser = value;
       else if (key == "proxy_pass") _cfg.proxyPass = value;
       else if (key == "bnc_enabled") _cfg.bncEnabled = strToBool(value);
+      else if (key == "bnc_mode") _cfg.bncMode = parseBouncerMode(value);
       else if (key == "bnc_user") _cfg.bncUser = value;
       else if (key == "bnc_network") _cfg.bncNetwork = value;
       else if (key == "bnc_pass") _cfg.bncPass = value;
@@ -1628,17 +1657,47 @@ class IrcClientApp {
     if (!passLine.isEmpty()) sendRawNoEcho("PASS " + passLine);
     sendRawNoEcho("CAP LS 302");
     sendRawNoEcho("NICK " + _cfg.nick);
-    sendRawNoEcho("USER " + _cfg.username + " 0 * :" + _cfg.realname);
+    sendRawNoEcho("USER " + buildRegistrationUsername() + " 0 * :" + _cfg.realname);
+  }
+
+  String buildRegistrationUsername() const {
+    if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju && !_cfg.bncUser.isEmpty()) {
+      String user = _cfg.bncUser;
+      if (!_cfg.bncNetwork.isEmpty()) user += "/" + _cfg.bncNetwork;
+      return user;
+    }
+    return _cfg.username;
   }
 
   String buildPassLine() const {
     if (!_cfg.serverPass.isEmpty()) return _cfg.serverPass;
     if (_cfg.bncEnabled && !_cfg.bncPass.isEmpty()) {
+      if (_cfg.bncMode == BouncerMode::Soju) {
+        return _cfg.saslEnabled ? "" : _cfg.bncPass;
+      }
       String left = _cfg.bncUser;
       if (!_cfg.bncNetwork.isEmpty()) left += "/" + _cfg.bncNetwork;
       if (!left.isEmpty()) return left + ":" + _cfg.bncPass;
       return _cfg.bncPass;
     }
+    return "";
+  }
+
+  String buildSaslUser() const {
+    if (!_cfg.saslUser.isEmpty()) return _cfg.saslUser;
+    if (_cfg.bncEnabled && !_cfg.bncUser.isEmpty()) {
+      String user = _cfg.bncUser;
+      if (_cfg.bncMode == BouncerMode::Soju && !_cfg.bncNetwork.isEmpty()) {
+        user += "/" + _cfg.bncNetwork;
+      }
+      return user;
+    }
+    return _cfg.nick;
+  }
+
+  String buildSaslPass() const {
+    if (!_cfg.saslPass.isEmpty()) return _cfg.saslPass;
+    if (_cfg.bncEnabled && !_cfg.bncPass.isEmpty()) return _cfg.bncPass;
     return "";
   }
 
@@ -2055,14 +2114,15 @@ class IrcClientApp {
   }
 
   void sendSaslPlainPayload() {
-    String user = _cfg.saslUser.isEmpty() ? _cfg.nick : _cfg.saslUser;
+    String user = buildSaslUser();
+    String pass = buildSaslPass();
     std::vector<uint8_t> payload;
-    payload.reserve(user.length() * 2 + _cfg.saslPass.length() + 2);
+    payload.reserve(user.length() * 2 + pass.length() + 2);
     for (size_t i = 0; i < user.length(); ++i) payload.push_back(static_cast<uint8_t>(user[i]));
     payload.push_back(0);
     for (size_t i = 0; i < user.length(); ++i) payload.push_back(static_cast<uint8_t>(user[i]));
     payload.push_back(0);
-    for (size_t i = 0; i < _cfg.saslPass.length(); ++i) payload.push_back(static_cast<uint8_t>(_cfg.saslPass[i]));
+    for (size_t i = 0; i < pass.length(); ++i) payload.push_back(static_cast<uint8_t>(pass[i]));
 
     String encoded = base64EncodeBytes(payload.data(), payload.size());
     const int chunkSize = 400;
