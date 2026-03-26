@@ -2,24 +2,20 @@ name: Build Cardputer Firmware
 
 on:
   push:
-    branches: [main, master]
+    branches: [ main, master ]
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
+env:
+  PIO_ENV: m5stack-stamps3
+  ESP_CHIP: esp32s3
+  FLASH_MODE: qio
+  FLASH_FREQ: 80m
+  FLASH_SIZE: 8MB
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      PIO_ENV: m5stack-stamps3
-      ESP_CHIP: esp32s3
-      FLASH_FREQ: 80m
-      FLASH_SIZE: 8MB
-    defaults:
-      run:
-        shell: bash
 
     steps:
       - name: Check out repository
@@ -30,117 +26,110 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Cache PlatformIO
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.platformio/.cache
-            ~/.platformio/packages
-            ~/.platformio/platforms
-          key: ${{ runner.os }}-platformio-${{ hashFiles('platformio.ini', '**/platformio.ini') }}
-          restore-keys: |
-            ${{ runner.os }}-platformio-
-
-      - name: Install build tools
+      - name: Install PlatformIO and esptool
         run: |
           python -m pip install --upgrade pip
           pip install platformio esptool
 
       - name: Build firmware
-        run: |
-          pio run -e "$PIO_ENV"
+        run: pio run -e "$PIO_ENV"
 
-      - name: Collect firmware files
+      - name: Prepare artifacts
+        shell: bash
         run: |
           set -euo pipefail
-          BUILD_DIR=".pio/build/${PIO_ENV}"
-          DIST_DIR="dist"
-          mkdir -p "$DIST_DIR"
 
-          cp "$BUILD_DIR/firmware.bin" "$DIST_DIR/firmware.bin"
-          cp "$BUILD_DIR/bootloader.bin" "$DIST_DIR/bootloader.bin"
-          cp "$BUILD_DIR/partitions.bin" "$DIST_DIR/partitions.bin"
+          BUILD_DIR=".pio/build/$PIO_ENV"
+          mkdir -p dist/launcher dist/fullflash dist/split dist/meta
 
-          BOOT_APP0="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
-          if [[ ! -f "$BOOT_APP0" ]]; then
-            echo "boot_app0.bin not found at expected path: $BOOT_APP0" >&2
+          cp "$BUILD_DIR/firmware.bin" dist/launcher/cardputer-launcher.bin
+          cp "$BUILD_DIR/firmware.bin" dist/split/firmware.bin
+          cp "$BUILD_DIR/bootloader.bin" dist/split/bootloader.bin
+          cp "$BUILD_DIR/partitions.bin" dist/split/partitions.bin
+
+          MAGIC="$(xxd -p -l 1 "$BUILD_DIR/firmware.bin")"
+          if [[ "$MAGIC" != "e9" ]]; then
+            echo "Expected firmware.bin to begin with ESP image magic e9, got: $MAGIC" >&2
             exit 1
           fi
-          cp "$BOOT_APP0" "$DIST_DIR/boot_app0.bin"
 
-      - name: Build merged firmware variants
-        run: |
-          set -euo pipefail
-          DIST_DIR="dist"
+          BOOT_APP0="$(find "$HOME/.platformio/packages" -path '*/tools/partitions/boot_app0.bin' | head -n 1)"
+          if [[ -z "$BOOT_APP0" ]]; then
+            echo "Could not locate boot_app0.bin under ~/.platformio/packages" >&2
+            exit 1
+          fi
 
-          # Variant 1: exact board defaults for m5stack-stamps3 (QIO / 80MHz / 8MB)
-          python -m esptool             --chip "$ESP_CHIP" merge-bin             -o "$DIST_DIR/cardputer-merged-qio.bin"             --flash-mode qio             --flash-freq "$FLASH_FREQ"             --flash-size "$FLASH_SIZE"             0x1000 "$DIST_DIR/bootloader.bin"             0x8000 "$DIST_DIR/partitions.bin"             0xe000 "$DIST_DIR/boot_app0.bin"             0x10000 "$DIST_DIR/firmware.bin"
+          echo "Using boot_app0: $BOOT_APP0"
+          cp "$BOOT_APP0" dist/meta/boot_app0.bin
 
-          # Variant 2: conservative standalone merged image for launchers / web-style installers
-          python -m esptool             --chip "$ESP_CHIP" merge-bin             -o "$DIST_DIR/cardputer-merged-dio.bin"             --flash-mode dio             --flash-freq "$FLASH_FREQ"             --flash-size "$FLASH_SIZE"             0x1000 "$DIST_DIR/bootloader.bin"             0x8000 "$DIST_DIR/partitions.bin"             0xe000 "$DIST_DIR/boot_app0.bin"             0x10000 "$DIST_DIR/firmware.bin"
+          python -m esptool --chip "$ESP_CHIP" merge-bin \
+            -o dist/fullflash/cardputer-fullflash.bin \
+            --flash-mode "$FLASH_MODE" \
+            --flash-freq "$FLASH_FREQ" \
+            --flash-size "$FLASH_SIZE" \
+            0x1000 "$BUILD_DIR/bootloader.bin" \
+            0x8000 "$BUILD_DIR/partitions.bin" \
+            0xe000 "$BOOT_APP0" \
+            0x10000 "$BUILD_DIR/firmware.bin"
 
-      - name: Inspect actual ESP images
-        run: |
-          set -euo pipefail
-          python -m esptool --chip "$ESP_CHIP" image-info dist/bootloader.bin | tee dist/image-info-bootloader.txt
-          python -m esptool --chip "$ESP_CHIP" image-info dist/firmware.bin | tee dist/image-info-firmware.txt
+          python -m esptool --chip "$ESP_CHIP" image-info "$BUILD_DIR/firmware.bin" > dist/meta/firmware-image-info.txt
+          python -m esptool --chip "$ESP_CHIP" image-info "$BUILD_DIR/bootloader.bin" > dist/meta/bootloader-image-info.txt
 
-      - name: Write flashing instructions
-        run: |
-          cat > dist/FLASHING.txt <<'EOF'
-          Split flash layout:
-            0x1000  bootloader.bin
-            0x8000  partitions.bin
-            0xe000  boot_app0.bin
-            0x10000 firmware.bin
+          cat > dist/meta/FLASHING.txt <<EOF
+          Cardputer artifact guide
+          =======================
 
-          Merged flash layout:
-            0x0000  cardputer-merged-qio.bin
-            0x0000  cardputer-merged-dio.bin
+          1) M5Apps / M5Launcher / WebUI / SD install
+             Use: launcher/cardputer-launcher.bin
+             Notes:
+             - This is the regular app image built by PlatformIO.
+             - Install it from Launcher as an app/update binary.
+             - Do NOT use cardputer-fullflash.bin inside Launcher.
 
-          Which merged file to try:
-          - Try cardputer-merged-dio.bin first for launchers / web-style installers.
-          - If you want the exact board-default flash mode, try cardputer-merged-qio.bin.
+          2) Direct USB flashing (esptool / web flasher / desktop flasher)
+             Use: fullflash/cardputer-fullflash.bin
+             Address: 0x0
+             Notes:
+             - This is the merged full-flash image containing bootloader,
+               partition table, boot_app0, and the application.
 
-          Notes:
-          - Both merged files are full-flash images and must be flashed at offset 0x0.
-          - The split files are the fallback if a launcher dislikes the merged image.
-          - image-info output is generated for bootloader.bin and firmware.bin, not the merged .bin files.
+          3) Split binaries
+             Use files from split/ only if you specifically want the separate
+             bootloader / partitions / firmware pieces for debugging or a custom
+             flashing flow.
           EOF
 
-      - name: Write checksums
-        run: |
-          sha256sum dist/cardputer-merged-qio.bin > dist/SHA256SUMS.txt
-          sha256sum dist/cardputer-merged-dio.bin >> dist/SHA256SUMS.txt
-          sha256sum dist/firmware.bin >> dist/SHA256SUMS.txt
-          sha256sum dist/bootloader.bin >> dist/SHA256SUMS.txt
-          sha256sum dist/partitions.bin >> dist/SHA256SUMS.txt
-          sha256sum dist/boot_app0.bin >> dist/SHA256SUMS.txt
-
-      - name: Upload merged firmware artifact
+      - name: Upload launcher artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cardputer-merged-firmware
+          name: cardputer-launcher
           path: |
-            dist/cardputer-merged-qio.bin
-            dist/cardputer-merged-dio.bin
-            dist/image-info-bootloader.txt
-            dist/image-info-firmware.txt
-            dist/FLASHING.txt
-            dist/SHA256SUMS.txt
+            dist/launcher/cardputer-launcher.bin
+            dist/meta/FLASHING.txt
+            dist/meta/firmware-image-info.txt
           retention-days: 7
 
-      - name: Upload split firmware artifact
+      - name: Upload full-flash artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cardputer-split-firmware
+          name: cardputer-fullflash
           path: |
-            dist/firmware.bin
-            dist/bootloader.bin
-            dist/partitions.bin
-            dist/boot_app0.bin
-            dist/image-info-bootloader.txt
-            dist/image-info-firmware.txt
-            dist/FLASHING.txt
-            dist/SHA256SUMS.txt
+            dist/fullflash/cardputer-fullflash.bin
+            dist/meta/FLASHING.txt
+            dist/meta/bootloader-image-info.txt
+            dist/meta/firmware-image-info.txt
+          retention-days: 7
+
+      - name: Upload split artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cardputer-split
+          path: |
+            dist/split/firmware.bin
+            dist/split/bootloader.bin
+            dist/split/partitions.bin
+            dist/meta/FLASHING.txt
+            dist/meta/boot_app0.bin
+            dist/meta/bootloader-image-info.txt
+            dist/meta/firmware-image-info.txt
           retention-days: 7
