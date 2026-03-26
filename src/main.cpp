@@ -98,6 +98,7 @@ enum ConfigFieldId {
   CFG_BNC_MODE,
   CFG_BNC_USER,
   CFG_BNC_NETWORK,
+  CFG_BNC_CLIENT,
   CFG_BNC_PASS,
   CFG_SASL_ENABLED,
   CFG_SASL_USER,
@@ -159,6 +160,7 @@ struct Config {
   BouncerMode bncMode = BouncerMode::Generic;
   String bncUser;
   String bncNetwork;
+  String bncClient;
   String bncPass;
 
   bool saslEnabled = false;
@@ -1117,6 +1119,7 @@ class IrcClientApp {
       case CFG_BNC_MODE: return "bnc_mode";
       case CFG_BNC_USER: return "bnc_user";
       case CFG_BNC_NETWORK: return "bnc_network";
+      case CFG_BNC_CLIENT: return "bnc_client";
       case CFG_BNC_PASS: return "bnc_pass";
       case CFG_SASL_ENABLED: return "sasl_enabled";
       case CFG_SASL_USER: return "sasl_user";
@@ -1155,6 +1158,7 @@ class IrcClientApp {
       case CFG_BNC_MODE: return bouncerModeToString(_editCfg.bncMode);
       case CFG_BNC_USER: return _editCfg.bncUser;
       case CFG_BNC_NETWORK: return _editCfg.bncNetwork;
+      case CFG_BNC_CLIENT: return _editCfg.bncClient;
       case CFG_BNC_PASS: return masked ? maskSecret(_editCfg.bncPass) : _editCfg.bncPass;
       case CFG_SASL_ENABLED: return boolToOnOff(_editCfg.saslEnabled);
       case CFG_SASL_USER: return _editCfg.saslUser;
@@ -1193,6 +1197,7 @@ class IrcClientApp {
       case CFG_PROXY_PASS: _editCfg.proxyPass = value; break;
       case CFG_BNC_USER: _editCfg.bncUser = value; break;
       case CFG_BNC_NETWORK: _editCfg.bncNetwork = value; break;
+      case CFG_BNC_CLIENT: _editCfg.bncClient = value; break;
       case CFG_BNC_PASS: _editCfg.bncPass = value; break;
       case CFG_SASL_USER: _editCfg.saslUser = value; break;
       case CFG_SASL_PASS: _editCfg.saslPass = value; break;
@@ -1240,6 +1245,7 @@ class IrcClientApp {
     f.println("bnc_mode=" + bouncerModeToString(cfg.bncMode));
     f.println("bnc_user=" + cfg.bncUser);
     f.println("bnc_network=" + cfg.bncNetwork);
+    f.println("bnc_client=" + cfg.bncClient);
     f.println("bnc_pass=" + cfg.bncPass);
     f.println("sasl_enabled=" + String(cfg.saslEnabled ? "true" : "false"));
     f.println("sasl_user=" + cfg.saslUser);
@@ -1420,6 +1426,7 @@ class IrcClientApp {
       else if (key == "bnc_mode") _cfg.bncMode = parseBouncerMode(value);
       else if (key == "bnc_user") _cfg.bncUser = value;
       else if (key == "bnc_network") _cfg.bncNetwork = value;
+      else if (key == "bnc_client") _cfg.bncClient = value;
       else if (key == "bnc_pass") _cfg.bncPass = value;
       else if (key == "sasl_enabled") _cfg.saslEnabled = strToBool(value);
       else if (key == "sasl_user") _cfg.saslUser = value;
@@ -1660,11 +1667,32 @@ class IrcClientApp {
     sendRawNoEcho("USER " + buildRegistrationUsername() + " 0 * :" + _cfg.realname);
   }
 
+  String buildSojuIdentity(const String& overrideUser = "") const {
+    String user = overrideUser;
+    user.trim();
+    if (user.isEmpty()) user = _cfg.bncUser;
+    if (user.isEmpty()) return user;
+
+    bool hasNetwork = user.indexOf('/') >= 0;
+    bool hasClient = user.indexOf('@') >= 0;
+
+    // soju's manual/legacy auth shape is username[/network].
+    // Only append @client when the user explicitly configured bnc_client
+    // for a multi-client soju setup.
+    if (!hasNetwork && !_cfg.bncNetwork.isEmpty()) {
+      user += "/" + _cfg.bncNetwork;
+      hasNetwork = true;
+    }
+    if (!hasClient && !_cfg.bncClient.isEmpty()) {
+      user += "@" + _cfg.bncClient;
+    }
+    return user;
+  }
+
   String buildRegistrationUsername() const {
-    if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju && !_cfg.bncUser.isEmpty()) {
-      String user = _cfg.bncUser;
-      if (!_cfg.bncNetwork.isEmpty()) user += "/" + _cfg.bncNetwork;
-      return user;
+    if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju) {
+      String user = buildSojuIdentity();
+      if (!user.isEmpty()) return user;
     }
     return _cfg.username;
   }
@@ -1684,6 +1712,13 @@ class IrcClientApp {
   }
 
   String buildSaslUser() const {
+    if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju) {
+      String explicitUser = _cfg.saslUser;
+      explicitUser.trim();
+      if (!explicitUser.isEmpty()) return buildSojuIdentity(explicitUser);
+      String user = buildSojuIdentity();
+      if (!user.isEmpty()) return user;
+    }
     if (!_cfg.saslUser.isEmpty()) return _cfg.saslUser;
     if (_cfg.bncEnabled && !_cfg.bncUser.isEmpty()) {
       String user = _cfg.bncUser;
@@ -2050,6 +2085,9 @@ class IrcClientApp {
       if (saslAck && _cfg.saslEnabled && !_saslCompleted && !_saslInProgress) {
         _saslInProgress = true;
         _saslWaitingForChallenge = true;
+        if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju) {
+          appendLine(statusTab(), "*** soju SASL auth user: " + buildSaslUser(), currentTimeStampShort(), currentTimeStampLong());
+        }
         sendRaw("AUTHENTICATE PLAIN");
       } else if (!_capNegotiationDone && !_saslInProgress) {
         sendRaw("CAP END");

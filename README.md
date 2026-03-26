@@ -76,6 +76,8 @@ bnc_enabled=false
 bnc_mode=generic
 bnc_user=
 bnc_network=
+# Optional for multi-client soju setups only
+#bnc_client=cardputer
 bnc_pass=
 
 # SASL PLAIN
@@ -113,7 +115,11 @@ When a preset other than `custom` is selected, the client syncs `irc_host`, `irc
 `bnc_mode` values:
 
 - `generic` = traditional ZNC-style `PASS user/network:password`
-- `soju` = soju-compatible manual auth; with SASL enabled it uses `username[/network]` + password for SASL PLAIN, and without SASL it sends the soju password in `PASS` and the soju user/network in `USER`
+- `soju` = soju-compatible manual auth; by default it uses `username[/network]` for auth. With SASL enabled it uses that identity plus the password for SASL PLAIN, and without SASL it sends the soju password in `PASS` and the soju user/network in `USER`
+
+Optional soju helper field:
+
+- `bnc_client` = optional; if set, the client appends `@<client>` to the soju identity (for example `cardputer`), yielding `username/network@client`. Leave it blank unless you intentionally want a distinct client name for a multi-client soju setup
 
 ## Runtime files
 

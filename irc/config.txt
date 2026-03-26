@@ -20,6 +20,8 @@ bnc_enabled=false
 bnc_mode=generic
 bnc_user=
 bnc_network=
+# Optional for multi-client soju setups only
+#bnc_client=
 bnc_pass=
 sasl_enabled=false
 sasl_user=
