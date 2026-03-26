@@ -34,6 +34,7 @@ static constexpr int BODY_Y = HEADER_H + 1;
 static constexpr int BODY_H = SCREEN_H - HEADER_H - INPUT_H - 2;
 static constexpr int CHAR_W = 6;
 static constexpr int CHAR_H = 8;
+static constexpr int ROW_H = CHAR_H + 2;
 static constexpr int NICK_PANE_W = 76;
 static constexpr int TIMESTAMP_W_CHARS = 6;
 static constexpr int CONFIG_BUTTON_PIN = 0;
@@ -2716,14 +2717,16 @@ class IrcClientApp {
     mode.toLowerCase();
     int n = countStr.isEmpty() ? 1 : std::max(1, static_cast<int>(countStr.toInt()));
 
-    int page = std::max(1, BODY_H / (CHAR_H + 2) - 1);
+    int textWidth = bodyTextWidth();
+    int page = std::max(1, bodyVisibleRows() - 1);
+    int totalRows = totalWrappedRows(tab, textWidth);
     if (mode == "up") tab.scroll += n;
     else if (mode == "down") tab.scroll = std::max(0, tab.scroll - n);
     else if (mode == "pageup") tab.scroll += n * page;
     else if (mode == "pagedown") tab.scroll = std::max(0, tab.scroll - (n * page));
-    else if (mode == "top") tab.scroll = static_cast<int>(tab.lines.size());
+    else if (mode == "top") tab.scroll = std::max(0, totalRows - bodyVisibleRows());
     else if (mode == "bottom") tab.scroll = 0;
-    if (tab.scroll < 0) tab.scroll = 0;
+    clampTabScroll(tab, textWidth);
   }
 
   void handleCommand(const String& cmdLine) {
@@ -3184,47 +3187,144 @@ class IrcClientApp {
     return SCREEN_W - paneWidth - 2;
   }
 
+  int bodyVisibleRows() const {
+    return std::max(1, BODY_H / ROW_H);
+  }
+
+  int wrappedTextRows(const String& raw, int maxWidth) const {
+    int charsPerRow = std::max(1, maxWidth / CHAR_W);
+    int row = 0;
+    int col = 0;
+    bool sawPrintable = false;
+
+    auto advanceRow = [&]() {
+      ++row;
+      col = 0;
+    };
+
+    for (size_t i = 0; i < raw.length(); ++i) {
+      char c = raw[i];
+      switch (c) {
+        case 0x02:
+        case 0x0F:
+        case 0x16:
+        case 0x1D:
+        case 0x1F:
+          break;
+        case 0x03: {
+          int j = i + 1;
+          int fgDigits = 0;
+          while (j < raw.length() && fgDigits < 2 && isdigit(static_cast<unsigned char>(raw[j]))) {
+            ++j;
+            ++fgDigits;
+          }
+          if (j < raw.length() && raw[j] == ',') {
+            ++j;
+            int bgDigits = 0;
+            while (j < raw.length() && bgDigits < 2 && isdigit(static_cast<unsigned char>(raw[j]))) {
+              ++j;
+              ++bgDigits;
+            }
+          }
+          i = j - 1;
+          break;
+        }
+        case '\n':
+          advanceRow();
+          sawPrintable = true;
+          break;
+        default:
+          sawPrintable = true;
+          if (col >= charsPerRow) advanceRow();
+          ++col;
+          if (col >= charsPerRow) advanceRow();
+          break;
+      }
+    }
+
+    if (!sawPrintable) return 1;
+    return std::max(1, row + (col > 0 ? 1 : 0));
+  }
+
+  int wrappedRowsForLine(const ChatLine& line, int maxWidth) const {
+    int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
+    if (textW <= 0) return 1;
+    return wrappedTextRows(line.raw, textW);
+  }
+
+  int totalWrappedRows(const Tab& tab, int maxWidth) const {
+    int total = 0;
+    for (const ChatLine& line : tab.lines) total += wrappedRowsForLine(line, maxWidth);
+    return std::max(0, total);
+  }
+
+  void clampTabScroll(Tab& tab, int maxWidth) {
+    int maxScroll = std::max(0, totalWrappedRows(tab, maxWidth) - bodyVisibleRows());
+    if (tab.scroll < 0) tab.scroll = 0;
+    if (tab.scroll > maxScroll) tab.scroll = maxScroll;
+  }
+
   void drawBody() {
     auto& gfx = drawTarget();
-    const Tab& tab = _tabs[_activeTab];
+    Tab& tab = _tabs[_activeTab];
     bool showPane = _cfg.nickPaneEnabled && tab.type == TabType::Channel;
     int paneWidth = showPane ? NICK_PANE_W : 0;
     int textWidth = SCREEN_W - paneWidth - 2;
-    int maxLines = BODY_H / (CHAR_H + 2);
-    int total = static_cast<int>(tab.lines.size());
-    int start = std::max(0, total - maxLines - tab.scroll);
-    int end = std::min(total, start + maxLines);
-    if (end - start < maxLines && start > 0) start = std::max(0, end - maxLines);
+    clampTabScroll(tab, textWidth);
+    int visibleRows = bodyVisibleRows();
+    int totalRows = totalWrappedRows(tab, textWidth);
+    int startRow = std::max(0, totalRows - visibleRows - tab.scroll);
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
     int y = BODY_Y + 1;
-    for (int i = start; i < end && y < BODY_Y + BODY_H - CHAR_H; ++i) {
-      drawChatLine(0, y, tab.lines[i], textWidth);
-      y += CHAR_H + 2;
+    int drawnRows = 0;
+    int currentRow = 0;
+    for (const ChatLine& line : tab.lines) {
+      int lineRows = wrappedRowsForLine(line, textWidth);
+      if (currentRow + lineRows <= startRow) {
+        currentRow += lineRows;
+        continue;
+      }
+      int skipRows = std::max(0, startRow - currentRow);
+      int rowsLeft = visibleRows - drawnRows;
+      if (rowsLeft <= 0) break;
+      int usedRows = drawChatLine(0, y, line, textWidth, skipRows, rowsLeft);
+      drawnRows += usedRows;
+      y += usedRows * ROW_H;
+      currentRow += lineRows;
+      if (drawnRows >= visibleRows || y >= BODY_Y + BODY_H - CHAR_H) break;
     }
 
     if (showPane) drawNickPane(tab);
   }
 
-  void drawChatLine(int x, int y, const ChatLine& line, int maxWidth) {
+  int drawChatLine(int x, int y, const ChatLine& line, int maxWidth, int skipRows, int maxRows) {
     auto& gfx = drawTarget();
     uint16_t lineBg = line.highlight ? UI_HILITE_BG : UI_BG;
-    gfx.fillRect(x, y, maxWidth, CHAR_H + 1, lineBg);
-    if (line.highlight) {
+    int totalRows = wrappedRowsForLine(line, maxWidth);
+    int rowsToDraw = std::max(0, std::min(maxRows, totalRows - skipRows));
+    for (int row = 0; row < rowsToDraw; ++row) {
+      int rowY = y + row * ROW_H;
+      gfx.fillRect(x, rowY, maxWidth, CHAR_H + 1, lineBg);
+    }
+    if (line.highlight && skipRows == 0 && rowsToDraw > 0) {
       gfx.fillRect(x, y, 2, CHAR_H + 1, UI_WARN);
     }
 
-    int stampX = x + 2;
-    gfx.setTextColor(UI_DIM, lineBg);
-    gfx.setCursor(stampX, y);
-    String stamp = line.stampShort;
-    if (stamp.length() > 5) stamp = stamp.substring(0, 5);
-    gfx.print(stamp);
+    if (skipRows == 0 && rowsToDraw > 0) {
+      int stampX = x + 2;
+      gfx.setTextColor(UI_DIM, lineBg);
+      gfx.setCursor(stampX, y);
+      String stamp = line.stampShort;
+      if (stamp.length() > 5) stamp = stamp.substring(0, 5);
+      gfx.print(stamp);
+    }
 
     int textX = x + 2 + TIMESTAMP_W_CHARS * CHAR_W;
     int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
-    drawStyledText(textX, y, line.raw, textW, lineBg);
+    drawStyledText(textX, y, line.raw, textW, lineBg, skipRows, rowsToDraw);
+    return rowsToDraw;
   }
 
   void drawNickPane(const Tab& tab) {
@@ -3288,29 +3388,42 @@ class IrcClientApp {
     gfx.print(rows[1]);
   }
 
-  void drawStyledText(int x, int y, const String& raw, int maxWidth, uint16_t baseBg) {
+  void drawStyledText(int x, int y, const String& raw, int maxWidth, uint16_t baseBg, int skipRows = 0, int maxRows = 1) {
     auto& gfx = drawTarget();
     TextStyle st;
     st.fg = UI_FG;
     st.bg = baseBg;
     int cx = x;
+    int row = 0;
+    int charsPerRow = std::max(1, maxWidth / CHAR_W);
+    int col = 0;
+
+    auto advanceRow = [&]() {
+      ++row;
+      cx = x;
+      col = 0;
+    };
 
     auto emitChar = [&](char out) {
-      if (cx + CHAR_W > x + maxWidth) return;
-      uint16_t fg = st.reverse ? st.bg : st.fg;
-      uint16_t bg = st.reverse ? st.fg : st.bg;
-      gfx.fillRect(cx, y, CHAR_W, CHAR_H + 1, bg);
-      gfx.setTextColor(fg, bg);
-      gfx.setCursor(cx, y);
-      gfx.print(out);
-      if (st.underline) {
-        gfx.drawFastHLine(cx, y + CHAR_H, CHAR_W, fg);
-      }
-      if (st.bold && cx + 1 < x + maxWidth) {
-        gfx.setCursor(cx + 1, y);
+      if (col >= charsPerRow) advanceRow();
+      if (row >= skipRows && row < skipRows + maxRows) {
+        int drawY = y + (row - skipRows) * ROW_H;
+        uint16_t fg = st.reverse ? st.bg : st.fg;
+        uint16_t bg = st.reverse ? st.fg : st.bg;
+        gfx.fillRect(cx, drawY, CHAR_W, CHAR_H + 1, bg);
+        gfx.setTextColor(fg, bg);
+        gfx.setCursor(cx, drawY);
         gfx.print(out);
+        if (st.underline) {
+          gfx.drawFastHLine(cx, drawY + CHAR_H, CHAR_W, fg);
+        }
+        if (st.bold && cx + 1 < x + maxWidth) {
+          gfx.setCursor(cx + 1, drawY);
+          gfx.print(out);
+        }
       }
       cx += CHAR_W;
+      ++col;
     };
 
     for (size_t i = 0; i < raw.length(); ++i) {
@@ -3356,10 +3469,14 @@ class IrcClientApp {
         case 0x1F:
           st.underline = !st.underline;
           break;
+        case '\n':
+          advanceRow();
+          break;
         default:
           emitChar(c);
           break;
       }
+      if (row >= skipRows + maxRows) break;
     }
   }
 };
